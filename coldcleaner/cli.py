@@ -14,6 +14,7 @@ from . import collect, disk, doctor, fleet, hosts, metrics, protect, reclaim, re
 
 RETRY_SECONDS = 30
 JSON_SCHEMA_VERSION = 1
+STANDARD_JSON_COMMANDS = ('reclaim', 'doctor', 'check-rules')
 JSON_RUN_EXIT = {0: 0, 1: 2, 3: 1}
 APPLY_SKIPPED = 'apply skipped: no complete reclaim dry-run report with the current rules; a dry run follows so it can apply next run'
 
@@ -169,7 +170,8 @@ def run(config, chosen_hosts, apply=False, *, as_json=False, deadline=None, skip
             (reports[0].errors if reports else errors).append('Attention note not written: ' + str(exc))
     if path:
         try:
-            fleet.write(config, seconds=(datetime.now(timezone.utc) - run_started).total_seconds(), reports=scanned_reports, plan=plan, scanned=scanned)
+            fleet.write(config, seconds=(datetime.now(timezone.utc) - run_started).total_seconds(),
+                        reports=scanned_reports, plan=plan, scanned=scanned, run_report=path)
         except OSError as exc:
             print(f'coldcleaner: fleet summary not written: {exc}', file=sys.stderr, flush=True)
     if failed:
@@ -260,10 +262,11 @@ def parser():
             command.add_argument('--local', action='store_true', help='Run --host on this machine without ssh (its own nightly).')
         if name == 'init':
             command.add_argument('--yes', action='store_true', help='Retain current settings without prompting.')
+        if name in STANDARD_JSON_COMMANDS:
+            command.add_argument('--json', action='store_true', help='Print one versioned JSON result. '
+                                 'Exit 0 on success, 1 for findings or refusal, or 2 for usage or runtime errors.')
         if name == 'reclaim':
             command.add_argument('--apply', action='store_true', help='Perform actions enabled by the rules instead of a dry run.')
-            command.add_argument('--json', action='store_true', help='Print one JSON summary on stdout and progress on stderr. '
-                                 'Exit 0 on success, 1 for attention or refusal, or 2 when incomplete.')
             command.add_argument('--i-reviewed', type=Path, metavar='REPORT',
                                  help='Require this complete dry-run report to cover the selected hosts and current rules.')
         if name == 'top':
@@ -278,7 +281,8 @@ def parser():
         if name == 'find':
             command.add_argument('term', help='Search archive records and file paths for this text.')
         if name == 'restore':
-            command.add_argument('id', help='Restore the archive with this ID.')
+            command.add_argument('id', help='Restore the archive or local quarantine entry with this ID.')
+            command.add_argument('--local', action='store_true', help='Restore a quarantine entry on this machine.')
             command.add_argument('--to', help='Replace the archived root with this path, including with --member.')
             command.add_argument('--member', help='Restore only this path within the archive.')
             command.add_argument('--to-host', help='Recover a legacy archive on this POSIX host. Requires --to.')
@@ -315,14 +319,15 @@ def restore_drill(config, scratch):
     return 0 if row['result'] == 'pass' else 1
 
 
-def json_refusal(message):
-    print(json.dumps(dict(schema_version=JSON_SCHEMA_VERSION, status='refused', reason=message)))
-    return 1
+def json_failure(message, code):
+    print(json.dumps(dict(schema_version=JSON_SCHEMA_VERSION,
+                          status='refused' if code == 1 else 'incomplete', reason=message)))
+    return code
 
 
-def refuse(args, message):
+def refuse(args, message, *, code=1):
     if getattr(args, 'json', False):
-        return json_refusal(message)
+        return json_failure(message, code)
     print(message)
     return 2
 
@@ -355,8 +360,11 @@ def main(argv=None):
     try:
         args = parser().parse_args(argv)
     except SystemExit as exc:
-        if exc.code == 2 and argv and argv[0] in ('reclaim', 'top') and '--json' in argv:
-            return json_refusal('invalid arguments; see stderr')
+        if exc.code == 2 and argv and '--json' in argv:
+            if argv[0] in STANDARD_JSON_COMMANDS:
+                return json_failure('invalid arguments; see stderr', 2)
+            if argv[0] == 'top':
+                return json_failure('invalid arguments; see stderr', 1)
         raise
     if args.command == 'init':
         from . import setup
@@ -366,8 +374,14 @@ def main(argv=None):
             return refuse(args, rules_problem(args.rules, str(exc) or 'input ended; settings unchanged'))
         return 0
     local = getattr(args, 'local', False)
+    if local and args.command == 'restore':
+        parts = args.id.split(':')
+        if len(parts) != 3 or parts[0] != 'quarantine':
+            return refuse(args, '--local requires a quarantine ID')
+        args.host = parts[1]
     if local and not args.host:
-        return refuse(args, 'coldcleaner: --local needs --host naming this machine')
+        return refuse(args, 'coldcleaner: --local needs --host naming this machine',
+                      code=2 if args.command in STANDARD_JSON_COMMANDS else 1)
     try:
         overrides = {'local': args.host} if local else {}
         report_dir = getattr(args, 'report_dir', None)
@@ -375,14 +389,17 @@ def main(argv=None):
             overrides['report_dir'] = report_dir.absolute()
         config = rules.load(args.rules, **overrides)
     except (OSError, ValueError) as exc:
-        if args.command == 'check-rules':
-            print(rules_problem(args.rules, exc))
-            return 2 if isinstance(exc, OSError) else 1
-        return refuse(args, rules_problem(args.rules, exc))
+        message = rules_problem(args.rules, exc)
+        code = 2 if isinstance(exc, (OSError, UnicodeDecodeError, rules.LocalHostError)) else 1
+        if args.command == 'check-rules' and not args.json:
+            print(message)
+            return code
+        return refuse(args, message, code=code if args.command in STANDARD_JSON_COMMANDS else 1)
     for option in ('host', 'to_host'):
         name = getattr(args, option, None)
         if name is not None and name not in hosts.HOSTS:
-            return refuse(args, f'coldcleaner: unknown --{option.replace("_", "-")} host: {name}; known hosts: {", ".join(sorted(hosts.HOSTS))}')
+            return refuse(args, f'coldcleaner: unknown --{option.replace("_", "-")} host: {name}; known hosts: {", ".join(sorted(hosts.HOSTS))}',
+                          code=2 if args.command in STANDARD_JSON_COMMANDS else 1)
     if getattr(args, 'to_host', None) and hosts.HOSTS[args.to_host].kind != 'posix':
         return refuse(args, 'coldcleaner: --to-host requires a POSIX host')
     if args.command == 'reclaim' and args.apply and not {'worktree', 'clone', 'archive'} & set(config['live']):
@@ -396,9 +413,16 @@ def main(argv=None):
         elif not Path(config['nas_root']).is_dir():
             return refuse(args, f"coldcleaner: reclaim --apply refused: nas_root {config['nas_root']} does not exist; "
                                 'create it on a network share (NFS or SMB) or under local_archive_mount (see docs/reference.md#archive-storage)')
+    if 'nas_root' not in config and (args.command in ('find', 'restore-drill')
+                                     or args.command == 'restore' and not args.id.startswith('quarantine:')):
+        return refuse(args, 'this archive command requires nas_root')
     if args.command == 'check-rules':
-        live = ', '.join(config['live']) or 'none'
-        print(f"OK: {args.rules} (live: {live}; alert {config['alert_pct']}%)")
+        if args.json:
+            print(json.dumps(dict(schema_version=JSON_SCHEMA_VERSION, status='ok', live=config['live'],
+                                  alert_pct=config['alert_pct'])))
+        else:
+            live = ', '.join(config['live']) or 'none'
+            print(f"OK: {args.rules} (live: {live}; alert {config['alert_pct']}%)")
         return 0
     try:
         if report_dir is not None and os.name != 'nt':
@@ -407,7 +431,13 @@ def main(argv=None):
         if args.command in ('reclaim', 'doctor') and not args.host:
             selected = [hosts.HOSTS[name] for name in config['reclaim_hosts']]
         if args.command == 'doctor':
-            return doctor.main(config, selected)
+            if not args.json:
+                return doctor.main(config, selected)
+            checks = [dict(name=name, ok=ok, detail=detail) for name, (ok, detail) in doctor.checks(config, selected)]
+            failed = any(not check['ok'] for check in checks)
+            print(json.dumps(dict(schema_version=JSON_SCHEMA_VERSION,
+                                  status='attention' if failed else 'ok', checks=checks)))
+            return int(failed)
         if args.command == 'restore-drill':
             return restore_drill(config, Path.home() / '.cache' / 'coldcleaner' / 'restore-drill')
         if args.command == 'approve':
@@ -426,12 +456,12 @@ def main(argv=None):
                 top.print_breakdown(result)
             return 2 if result['missing_hosts'] else 0
         if args.command == 'metrics':
-            print('\n'.join(metrics.render(metrics.compute(config['report_dir'], config['nas_root'], args.days), args.days)))
+            print('\n'.join(metrics.render(metrics.compute(config['report_dir'], config.get('nas_root'), args.days), args.days)))
             return 0
         if args.command == 'reclaim':
             collection = {'collect_reports': True} if args.apply and not args.host and config.get('collect_hosts') else {}
             if args.apply and args.i_reviewed is not None:
-                covered = report.dry_run_hosts(args.i_reviewed, config.get('rules_sha256'))
+                covered = report.dry_run_hosts(args.i_reviewed, config.get('rules_sha256'), strict=True)
                 missing = [host.name for host in selected if host.name not in covered]
                 if missing:
                     return refuse(args, f"coldcleaner: reclaim --apply refused: {args.i_reviewed} is not a complete "
@@ -471,6 +501,15 @@ def main(argv=None):
                 print_archive(record)
             if not records:
                 print(f'no archives match {args.term!r}')
+        elif args.command == 'restore' and args.id.startswith('quarantine:'):
+            _, host, ident = args.id.split(':')
+            if host not in hosts.HOSTS or args.to_host or args.member:
+                raise ValueError('quarantine restore needs the original host and the whole item')
+            restored = reclaim.probe(hosts.HOSTS[host], 'quarantine-restore', host_name=host, id=ident, to=args.to)
+            record_human_action(config, args.command, 1)
+            print(f"restored {args.id} to {host}:{restored['restored']}")
+            if restored.get('partial'):
+                print('A previous purge was interrupted. The recovered item may be incomplete.', file=sys.stderr)
         elif args.command == 'restore':
             record = store.restore(args.id, config['nas_root'], to=args.to, member=args.member, to_host=args.to_host)
             record_human_action(config, args.command, 1)
@@ -484,8 +523,7 @@ def main(argv=None):
             print(message, file=sys.stderr)
             print(json.dumps(summary([], args.apply, None, version.describe(), 'incomplete', [message]), default=str))
             return 2
-        if args.command == 'top' and args.json:
+        if args.command in ('doctor', 'top') and args.json:
             print(message, file=sys.stderr)
-            print(json.dumps(dict(schema_version=JSON_SCHEMA_VERSION, status='incomplete', reason=message)))
-            return 2
+            return json_failure(message, 2)
         return refuse(args, message)

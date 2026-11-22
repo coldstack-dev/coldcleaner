@@ -218,7 +218,7 @@ def gib(value):
 def render(found, days=DAYS, now=None):
     now = now or datetime.now(timezone.utc)
     lines = [f'Last {days} days, from the reclaim --apply action log, reports and storage-time.jsonl. '
-             'Restores count all INDEX rows with status restored.', '',
+             'Disk history uses retained reports. Restores count all INDEX rows with status restored.', '',
              '| Host | Reclaimed GiB (acted) | Disk freed GiB (df) | Candidates | Acted | Held for a person | Automation rate '
              f'| Recreated after removal | Restores | Human actions ({days}d) | Restore drill | Disk used | Oldest held |',
              '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |']

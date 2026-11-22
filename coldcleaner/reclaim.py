@@ -21,10 +21,10 @@ import uuid
 from . import locking, hosts, protect, reclaim_probe, rules, store, version
 
 
-SOURCE = Path(reclaim_probe.__file__).read_text() + '''
+SOURCE = Path(locking.__file__).read_text() + '\n' + Path(reclaim_probe.__file__).read_text() + '''
 try:
     request = json.loads(sys.stdin.buffer.readline())
-    if request.get('windows_local') and request['operation'] in ('activity', 'batch', 'guard', 'manifest', 'remove'):
+    if request.get('windows_local') and request['operation'] in ('activity', 'batch', 'guard', 'manifest', 'remove', 'quarantine-purge'):
         enable_debug_privilege()
     response = main(request)
     if request['operation'] not in ('tar', 'bundle'):
@@ -91,7 +91,10 @@ def hint(path):
 def github_url(url):
     if re.fullmatch(r'git@github\.com:[^\s]+', url):
         return True
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
     return parsed.scheme in {'https', 'ssh', 'git'} and parsed.hostname == 'github.com'
 
 
@@ -103,6 +106,28 @@ def repository(url):
     if not re.fullmatch(r'[\w.-]+/[\w.-]+', value):
         raise ValueError('invalid GitHub repository')
     return value
+
+
+def display_remote(url):
+    if re.match(r'[A-Za-z][A-Za-z0-9+.-]*://', url):
+        try:
+            parsed = urlsplit(url)
+            host, path = parsed.hostname, parsed.path
+        except ValueError:
+            return '<invalid remote URL>'
+        clean = parsed._replace(netloc=parsed.netloc.rsplit('@', 1)[-1]).geturl()
+    else:
+        scp = re.fullmatch(r'(?:[^:/\\@\s]+@)?(\[[^\]]+\]|[^:/\\@\s]+):(.*)', url)
+        if not scp:
+            return url
+        host, path = scp.groups()
+        clean = f'{host}:{path}'
+    if host and host.casefold() == 'github.com':
+        try:
+            return 'https://github.com/' + repository('https://github.com/' + path.lstrip('/'))
+        except ValueError:
+            pass
+    return clean
 
 
 def github_pr_query(args, repo=None):
@@ -291,7 +316,8 @@ def preserve_git(host, path, directory, state):
                 process.terminate(); process.wait()
     destination.chmod(0o600)
     check_bundle(destination, state['head'], state['reflog'])
-    return dict(head=state['head'], branch=state['branch'], remote=state['remote'], reflog=state['reflog'], **metadata)
+    return dict(head=state['head'], branch=state['branch'], remote=display_remote(state['remote']),
+                reflog=state['reflog'], **metadata)
 
 
 @contextlib.contextmanager
@@ -362,7 +388,7 @@ def retire_attempts(root, records):
 
 
 def git_identity(git):
-    return git and (git['head'], git['branch'], git['remote'], tuple(git.get('reflog') or ()))
+    return git and (git['head'], git['branch'], display_remote(git['remote']), tuple(git.get('reflog') or ()))
 
 
 def stored_copy(host, path, root, records, initial, git, *, verify_copy=True):
@@ -754,21 +780,21 @@ def write_plan(path, reports, rules_sha256):
 
 
 def approve(directory, plan, ids):
-    items = json.loads(Path(plan).read_text()).get('items')
-    if not isinstance(items, list) or not all(
-            isinstance(item, dict) and set(item) == PLAN_KEYS and isinstance(item['id'], str) and ITEM_ID.fullmatch(item['id'])
-            and item['tier'] in rules.APPROVAL_TIERS and type(item['bytes']) is int and type(item['approval']) is bool
-            and all(isinstance(item[key], str) for key in ('host', 'path', 'rule', 'reason')) for item in items):
-        raise ValueError(f'{plan} is not a reclaim dry-run plan')
-    items = {item['id']: item for item in items}
-    if 'all' in ids and len(ids) > 1:
-        raise ValueError('approve takes item IDs or all, not both')
-    chosen = list(items) if ids == ['all'] else list(dict.fromkeys(ids))
-    unknown = [ident for ident in chosen if ident not in items]
-    if unknown:
-        raise ValueError(f'not in plan {plan}: ' + ', '.join(unknown))
-    at = datetime.now(timezone.utc).isoformat()
     with approvals(directory) as found:
+        items = json.loads(Path(plan).read_text()).get('items')
+        if not isinstance(items, list) or not all(
+                isinstance(item, dict) and set(item) == PLAN_KEYS and isinstance(item['id'], str) and ITEM_ID.fullmatch(item['id'])
+                and item['tier'] in rules.APPROVAL_TIERS and type(item['bytes']) is int and type(item['approval']) is bool
+                and all(isinstance(item[key], str) for key in ('host', 'path', 'rule', 'reason')) for item in items):
+            raise ValueError(f'{plan} is not a reclaim dry-run plan')
+        items = {item['id']: item for item in items}
+        if 'all' in ids and len(ids) > 1:
+            raise ValueError('approve takes item IDs or all, not both')
+        chosen = list(items) if ids == ['all'] else list(dict.fromkeys(ids))
+        unknown = [ident for ident in chosen if ident not in items]
+        if unknown:
+            raise ValueError(f'not in plan {plan}: ' + ', '.join(unknown))
+        at = datetime.now(timezone.utc).isoformat()
         for ident in chosen:
             found[ident] = dict(host=items[ident]['host'], tier=items[ident]['tier'], path=items[ident]['path'],
                                 plan=str(Path(plan).resolve()), approved_at=at)
@@ -890,6 +916,8 @@ class Reclaimer:
         return f'{self.host.name}.{key}:{match}'
 
     def log(self, tier, path, action, size=0, reason='', record=True, *, rule, idle_days, **extra):
+        if 'remote' in extra:
+            extra['remote'] = display_remote(extra['remote'])
         row = dict(tier=tier, path=path, action=action, bytes=size, reason=reason, rule=rule, idle_days=idle_days,
                    rules_sha256=self.config.get('rules_sha256'), code=self.code, **extra)
         self.report.actions.append(row)
@@ -937,15 +965,15 @@ class Reclaimer:
     def origin_listing(self, repo, fresh=False):
         if fresh or repo not in self.listings:
             url = 'https://github.com/' + repo + '.git'
-            effective = hosts.controller(['git', 'ls-remote', '--get-url', '--', url]).stdout.decode().strip()
-            if repository(effective).casefold() != repo.casefold():
-                raise ValueError('origin URL is rewritten to another repository')
             try:
+                effective = hosts.controller(['git', 'ls-remote', '--get-url', '--', url]).stdout.decode().strip()
+                if repository(effective).casefold() != repo.casefold():
+                    raise ValueError('origin URL is rewritten to another repository')
                 result = hosts.controller(['git', 'ls-remote', '--', url], git_noninteractive=True)
             except subprocess.CalledProcessError as exc:
                 if b'remote: Repository not found.' in (exc.stderr or b''):
                     raise ValueError('UNIQUE: GitHub repository not found: ' + repo) from None
-                raise
+                raise RuntimeError(f'Git origin lookup failed for {display_remote(url)} (exit {exc.returncode})') from None
             self.listings[repo] = result.stdout.decode()
         return self.listings[repo]
 
@@ -1142,7 +1170,7 @@ class Reclaimer:
                         raise
                     reason = completion(state, prs)
                     if reason.startswith('UNIQUE: unpushed'):
-                        reason += ': head ' + state['head'][:12] + ' is not on ' + state['remote']
+                        reason += ': head ' + state['head'][:12] + ' is not on ' + display_remote(state['remote'])
                     if reason and abandoned_work(state, prs):
                         days = self.config['abandoned_idle_days']
                         self.abandoned(path, rule, days, state, prs, reason)
@@ -1380,12 +1408,71 @@ class Reclaimer:
         finally:
             self.size_skips()
 
+    def restore_command(self, ident):
+        local = ' --local' if self.host.ssh is None and self.rules.get('ssh') else ''
+        return f'coldcleaner restore{local} {ident}'
+
+    def quarantine_policy(self):
+        return dict(archive=self.rules.get('archive', []), exclude=self.rules.get('exclude', []),
+                    approval=self.gated('archive'), notes_vault=self.config.get('notes_vault', 'on'),
+                    idle=self.config.get('archive_idle_days'), wait=self.config.get('wait_period_days'))
+
+    def quarantines(self):
+        restored = []
+        try:
+            entries = probe(self.host, 'quarantine-list', host_name=self.host.name,
+                            retire=self.apply and 'archive' in self.config['live'], policy=self.quarantine_policy())
+        except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            self.report.errors.append(f'Quarantine inventory incomplete: {exc}')
+            return restored
+        for entry in entries:
+            self.check_deadline('while checking local quarantine')
+            if 'note' in entry:
+                self.report.notes.append(entry['note'])
+                continue
+            if 'restore_hold' in entry:
+                restored.append(entry['restore_hold'])
+                continue
+            path, size = entry['path'], entry['bytes']
+            fields = dict(rule=entry['rule'], idle_days=entry['days'], category=entry['category'])
+            restore_id = f"quarantine:{self.host.name}:{entry['id']}"
+            reason = f'Quarantined at {path}; restore with {self.restore_command(restore_id)}'
+            if not entry['expired']:
+                self.log('archive', path, 'held in quarantine', size, reason, **fields)
+                continue
+            try:
+                if not entry['policy_matches']:
+                    raise ValueError('archive policy changed since quarantine; restore and reassess')
+                if not self.apply or 'archive' not in self.config['live']:
+                    self.log('archive', path, 'would purge', size, reason, **fields)
+                    continue
+                protection = protect.collect(self.host)
+                if isinstance(protection, protect.Protection):
+                    protection.broad_paths.update(self.rules.get('shared_roots', []))
+                blocked(protection.reason(path))
+                receipt = entry['receipt'] and rules.preservation_receipt(
+                    self.config, self.host.name, entry['source'], 'sha256')
+                self.budget(size)
+                result = probe(self.host, 'quarantine-purge', path=path, host_name=self.host.name, id=entry['id'],
+                               policy=self.quarantine_policy(), protected=self.rules.get('protected', []),
+                               broad=self.broad_cwds(), bytes=size, receipt=receipt)
+                self.log('archive', path, 'purge quarantine', result['bytes'], f"Retention elapsed for {entry['source']}", **fields)
+            except ValueError as exc:
+                self.log('archive', path, 'skip', size, str(exc), **fields)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                self.log('archive', path, 'error', size, str(exc), **fields)
+
+        return restored
+
     def archives(self):
+        standalone = self.config.get('archive_before_delete', 'on') == 'off'
         listed = rules.archive_patterns(self.rules)
         children = [entry['path'] for entry in self.rules.get('archive', [])
                     if isinstance(entry, dict) and 'age_days' in entry]
         patterns = probe(self.host, 'expand', patterns=listed, children=children,
                          exclude={pattern: rules.archive_entry(self.rules, pattern)['exclude'] for pattern in listed})
+        self.check_deadline('while preparing archive patterns; 0 items done')
+        restored = self.quarantines()
         paths = list(patterns)
         tagged = {}
         for pattern in listed:
@@ -1415,7 +1502,9 @@ class Reclaimer:
                 try:
                     if package_cache(path):
                         raise ValueError('package caches are excluded')
-                    if 'nas_root' not in self.config:
+                    if any(protect.overlaps(path, target, self.host.kind == 'powershell') for target in restored):
+                        raise ValueError('recently restored from quarantine')
+                    if 'nas_root' not in self.config and not standalone:
                         raise ValueError('archive requires nas_root')
                     days = self.archive_days(patterns[path], path)
                     gated = self.gated('archive', patterns[path])
@@ -1428,11 +1517,13 @@ class Reclaimer:
                     if self.config.get('notes_vault', 'on') == 'off':
                         policy = None
                     receipt = policy and rules.preservation_receipt(self.config, self.host.name, path, policy)
+                    destination_identity = receipt and probe(self.host, 'preservation', path=path, receipt=receipt)
                     ident = item_id(self.host.name, 'archive', path, info)
                     if not self.apply or 'archive' not in self.config['live']:
                         self.log('archive', path, 'would archive and remove' if self.config.get('archive_before_delete', 'on') != 'off' else 'would remove', size,
-                                 ('UNIQUE: copy to NAS and verify every file SHA-256 before removal' if self.config.get('backup_copy_check', 'on') != 'off' else 'Copy to NAS; copy check disabled') if self.config.get('archive_before_delete', 'on') != 'off' else 'Archive disabled by rules', rule=rule, idle_days=days,
-                                 category=category, id=ident, approval=gated)
+                                 ('UNIQUE: copy to NAS and verify every file SHA-256 before removal' if self.config.get('backup_copy_check', 'on') != 'off' else 'Copy to NAS; copy check disabled') if self.config.get('archive_before_delete', 'on') != 'off' else f"Local quarantine for {self.config['quarantine_days']} days", rule=rule, idle_days=days,
+                                 category=category, id=ident, approval=gated,
+                                 **({'quarantine_days': self.config['quarantine_days']} if standalone else {}))
                         continue
                     if gated:
                         self.check_approval(ident, 'archive', path)
@@ -1447,17 +1538,26 @@ class Reclaimer:
                     fresh = recheck()['bytes']
                     self.budget(fresh, reserve=False)
                     saved, manifest, security, drive = self.copy_source(path, recheck)
-                    receipt = policy and rules.preservation_receipt(self.config, self.host.name, path, policy)
-                    if policy == 'sha256' and receipt['sha256'] != rules.content_hash(manifest):
-                        raise ValueError('preservation receipt sha256 does not match the original')
                     if saved:
                         self.archive_present(path, drive, saved)
+                    if receipt and rules.preservation_receipt(self.config, self.host.name, path, policy) != receipt:
+                        raise ValueError('preservation receipt changed before removal')
                     self.budget(max(fresh, saved.original_bytes if saved else 0))
-                    probe(self.host, 'remove', path=path, days=days, protected=self.rules.get('protected', []), broad=self.broad_cwds(), exclude=exclude, manifest=manifest, security=security, keep=self.keep(saved),
-                          digest=info['digest'] if gated else None)
-                    self.log('archive', path, 'archive and remove' if saved else 'remove', size,
-                             (('DURABLE ELSEWHERE: every file SHA-256 verified at ' if self.config.get('backup_copy_check', 'on') != 'off' else 'Archive copy check disabled; copy at ') + saved.archive_path if saved else 'archive disabled by rules'), rule=rule, idle_days=days,
-                             category=category)
+                    quarantine = dict(days=self.config['quarantine_days'], policy=self.quarantine_policy(),
+                                      rule=rule, category=category, host=self.host.name) if standalone else None
+                    removed = probe(self.host, 'remove', path=path, days=days, protected=self.rules.get('protected', []),
+                                    broad=self.broad_cwds(), exclude=exclude, manifest=manifest, security=security,
+                                    keep=self.keep(saved), receipt=receipt, destination_identity=destination_identity,
+                                    digest=info['digest'] if gated else None, quarantine=quarantine)
+                    if standalone:
+                        reason = (f"Quarantined at {removed['quarantine_path']} for {quarantine['days']} days; "
+                                  f"restore with {self.restore_command(removed['restore_id'])}")
+                    elif self.config.get('backup_copy_check', 'on') != 'off':
+                        reason = 'DURABLE ELSEWHERE: every file SHA-256 verified at ' + saved.archive_path
+                    else:
+                        reason = 'Archive copy check disabled; copy at ' + saved.archive_path
+                    self.log('archive', path, 'archive and remove' if saved else 'remove', size, reason,
+                             rule=rule, idle_days=days, category=category, **(removed if standalone else {}))
                     if gated:
                         self.consume(ident)
                 except ValueError as exc:

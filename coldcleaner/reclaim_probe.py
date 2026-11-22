@@ -14,12 +14,44 @@ import sys
 import tarfile
 import time
 
+if __package__:
+    from .locking import lock
+
 
 def sha256_hex(stream):
     digest = hashlib.sha256()
     for chunk in iter(lambda: stream.read(1024 * 1024), b''):
         digest.update(chunk)
     return digest.hexdigest()
+
+
+def preservation_destination(source, receipt):
+    destination = Path(receipt['destination'])
+    def identity(info):
+        return [info.st_dev, info.st_ino, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+    try:
+        original = source.lstat()
+        if not stat.S_ISREG(original.st_mode):
+            raise ValueError('preservation receipt requires a regular source file')
+        if not destination.is_absolute() or destination.resolve(strict=True) != destination or overlap(destination, receipt['path']):
+            raise ValueError('preservation destination must be an independent file outside the cleanup target')
+        before = destination.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or os.path.samestat(original, before):
+            raise ValueError('preservation destination is not an independent regular file')
+        flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0)
+        for path, snapshot, reason in (
+                (source, original, 'preservation receipt sha256 does not match the original'),
+                (destination, before, 'preservation destination changed or its sha256 does not match')):
+            with os.fdopen(os.open(path, flags), 'rb') as stream:
+                if identity(os.fstat(stream.fileno())) != identity(snapshot) or sha256_hex(stream) != receipt['sha256']:
+                    raise ValueError(reason)
+        if identity(source.lstat()) != identity(original):
+            raise ValueError('preservation source changed during verification')
+        if identity(destination.lstat()) != identity(before) or destination.resolve(strict=True) != destination:
+            raise ValueError('preservation destination changed')
+        return identity(before)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f'preservation destination unavailable: {exc}') from None
 
 
 def windows_change_time(kernel, handle, path):
@@ -958,9 +990,15 @@ def unlisted(roots, covered, skip, seconds, state=None, save=False):
                 grew=sorted(grew, key=lambda row: row['before'] - row['bytes']))
 
 
-def tree(path, hashes=False, approval=False):
+QUARANTINE_PREFIX = '.coldcleaner-quarantine-'
+QUARANTINE_STATE = '~/.config/coldcleaner/quarantine'
+
+
+def tree(path, hashes=False, approval=False, quarantined=False):
     present(path)
     path = Path(path)
+    if not quarantined and any(part.casefold().startswith(QUARANTINE_PREFIX) for part in path.parts):
+        raise ValueError('held in local quarantine: ' + str(path))
     mount_boundary(path)
     path = Path(extended(path))
     approval = approval and os.name == 'nt'
@@ -973,6 +1011,8 @@ def tree(path, hashes=False, approval=False):
     pending = [path]
     while pending:
         item = pending.pop()
+        if item.name.casefold().startswith(QUARANTINE_PREFIX):
+            raise ValueError('contains local quarantine: ' + str(item))
         if package_cache(item):
             raise ValueError('package caches are excluded: ' + str(item))
         info = item.lstat()
@@ -1025,7 +1065,7 @@ PERSONAL_FOLDERS = ('Documents', 'Desktop', 'Pictures', 'Library', 'iCloud Drive
 
 def protected_location(path, extra=()):
     home = Path.home()
-    locations = [str(home / name) for name in PERSONAL_FOLDERS]
+    locations = [expanded(QUARANTINE_STATE), *(str(home / name) for name in PERSONAL_FOLDERS)]
     locations += [os.path.expandvars(os.path.expanduser(item)) for item in extra]
     if os.name == 'nt':
         system = os.environ.get('SystemRoot', 'C:\\Windows')
@@ -1070,10 +1110,17 @@ def local_policy():
     return policy
 
 
-def locally_allowed(path, worktree):
+def locally_allowed(path, worktree, *, moved=False):
     import glob
     policy = local_policy()
-    if worktree:
+    if moved:
+        import fnmatch
+        source = Path(path)
+        allowed = any(source.parent == Path(parent) and fnmatch.fnmatch(source.name, pattern.name)
+                      and (not source.name.startswith('.') or pattern.name.startswith('.'))
+                      for item in policy.get('archive', []) for pattern in [Path(expanded(item))]
+                      for parent in glob.glob(str(pattern.parent)))
+    elif worktree:
         allowed = any(contained(path, root) for root in policy.get('roots', []))
     else:
         target = os.path.normcase(os.path.normpath(path))
@@ -1261,7 +1308,7 @@ class ActivityPaths:
         return self.references[path]
 
 
-def guard(path, days=0, activity=None, protected=(), approval=False, activity_paths=None, broad=()):
+def guard(path, days=0, activity=None, protected=(), approval=False, activity_paths=None, broad=(), quarantined=False):
     path = Path(path)
     if not path.is_absolute() or '..' in path.parts or path in (Path(path.anchor), Path.home()):
         raise ValueError('invalid cleanup root')
@@ -1297,7 +1344,10 @@ def guard(path, days=0, activity=None, protected=(), approval=False, activity_pa
         reference = activity_paths.reference_key(reference)
         if reference.startswith(prefix) or reference == normalized:
             raise ValueError('running process uses ' + reference)
-    info = tree(path, approval=True) if approval and os.name == 'nt' else tree(path)
+    options = {'approval': True} if approval and os.name == 'nt' else {}
+    if quarantined:
+        options['quarantined'] = True
+    info = tree(path, **options)
     if info['newest'] > time.time() - days * 86400:
         raise ValueError('recent activity within %s days' % days)
     return info
@@ -1347,7 +1397,30 @@ def repo(path, listing='', stub_ok=False, abandoned=False):
         raise ValueError('UNIQUE: Git repository unreadable: ' + str(exc)) from None
 
 
+def git_dirs(path):
+    return tuple(Path(git(path, 'rev-parse', '--path-format=absolute', option))
+                 for option in ('--git-dir', '--git-common-dir'))
+
+
+def check_git_locks(admin, common):
+    try:
+        pending = list(dict.fromkeys((common.resolve(strict=True), admin.resolve(strict=True))))
+        while pending:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    if entry.name.lower().endswith('.lock'):
+                        raise ValueError('Git transaction lock: ' + entry.path)
+                    if entry.is_dir():
+                        if entry.is_symlink() or (os.name == 'nt' and entry.is_junction()):
+                            raise OSError('cannot inspect linked Git directory ' + entry.path)
+                        pending.append(entry.path)
+    except OSError as exc:
+        raise ValueError('Git transaction lock state unreadable: ' + str(exc)) from None
+
+
 def repo_state(path, listing, abandoned=False):
+    admin, common = git_dirs(path)
+    check_git_locks(admin, common)
     local_refs =git(path, 'for-each-ref', '--format=%(refname)',
                      'refs/worktree/', 'refs/bisect/', 'refs/rewritten/')
     if local_refs:
@@ -1365,9 +1438,8 @@ def repo_state(path, listing, abandoned=False):
     dirty = dirty or unmerged or gitlinks
     index_only = (unmerged or gitlinks or any(line[:1].islower() or line.startswith('S ') for line in flags)
                   or git(path, 'diff', '--cached', '--quiet', check=False).returncode != 0
-                  or in_progress(Path(git(path, 'rev-parse', '--path-format=absolute', '--git-dir'))))
+                  or in_progress(admin))
     ignored = bool(git(path, 'ls-files', '--others', '--ignored', '--exclude-standard'))
-    common = Path(git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
     if (common / 'info/grafts').exists() and (common / 'info/grafts').stat().st_size:
         raise ValueError('Git grafts prevent ancestry proof')
     refs = dict((line.split()[1], line.split()[0]) for line in listing.splitlines() if len(line.split()) == 2)
@@ -1394,7 +1466,7 @@ def repo_state(path, listing, abandoned=False):
               if line.startswith('worktree ') and os.path.isdir(line[9:])
               and os.path.realpath(line[9:]) != os.path.realpath(path)]
     worktree = (Path(path) / '.git').is_file()
-    linked_worktree = worktree and Path(git(path, 'rev-parse', '--path-format=absolute', '--git-dir')).resolve() != common.resolve()
+    linked_worktree = worktree and admin.resolve() != common.resolve()
     shared_stash = bool(git(path, 'stash', 'list'))
     stashes = not linked_worktree and shared_stash
     return dict(path=str(path), head=head, branch=branch, dirty=dirty, index_only=index_only, ignored=ignored,
@@ -1467,6 +1539,7 @@ def check_admin(source, common, admin, token=None):
         raise ValueError('worktree is locked')
     if in_progress(admin):
         raise ValueError('Git operation in progress')
+    check_git_locks(admin, common)
     binding = (admin / 'gitdir').read_text().strip()
     if Path(binding).resolve() != (source / '.git').resolve():
         raise ValueError('worktree admin folder belongs to another worktree')
@@ -1552,9 +1625,206 @@ def clone_proof(path, listing):
     return dict(unique_refs=unique, reflog=sorted(unpublished(path, sorted(history), published)))
 
 
+def rename_new(source, target):
+    if os.name == 'nt':
+        os.rename(source, target)
+        return
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == 'darwin' and hasattr(libc, 'renamex_np'):
+        result = libc.renamex_np(os.fsencode(source), os.fsencode(target), 4)
+    elif sys.platform.startswith('linux') and hasattr(libc, 'renameat2'):
+        result = libc.renameat2(-100, os.fsencode(source), -100, os.fsencode(target), 1)
+    else:
+        raise ValueError('atomic restore without overwrite is unavailable')
+    if result:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(target))
+
+
+def quarantine_record(ident):
+    if not isinstance(ident, str) or not re.fullmatch('[0-9a-f]{32}', ident):
+        raise ValueError('invalid quarantine ID')
+    return Path(expanded(QUARANTINE_STATE)) / (ident + '.json')
+
+
+def save_quarantine_record(record, entry):
+    pending = record.with_suffix('.partial')
+    try:
+        with pending.open('x', encoding='utf-8') as stream:
+            json.dump(entry, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        pending.replace(record)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def unlinked_path(path):
+    if not path.is_absolute() or '..' in path.parts:
+        return False
+    for part in (path, *path.parents):
+        try:
+            info = part.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 1024:
+            return False
+    return True
+
+
+def held_path(source, ident):
+    return source.parent / (QUARANTINE_PREFIX + ident) / source.name
+
+
+def quarantine_policy(source, policy):
+    import fnmatch
+    def overlaps_pattern(pattern):
+        parts = Path(expanded(pattern)).parts
+        return all(fnmatch.fnmatch(part, glob_part) for part, glob_part in zip(source.parts, parts))
+    archive = [rule for rule in policy['archive'] if overlaps_pattern(rule['path'] if isinstance(rule, dict) else rule)]
+    exclude = [pattern for pattern in policy['exclude'] if overlaps_pattern(pattern)]
+    relevant = dict(policy, archive=archive, exclude=exclude)
+    return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()
+
+
+def quarantine_entries(host, *, retire=False, policy=None):
+    entries = []
+    state = Path(expanded(QUARANTINE_STATE))
+    if not state.is_dir():
+        return entries
+    for record in sorted(state.glob('*.json')):
+        try:
+            quarantine_record(record.stem)
+            entry = json.loads(record.read_bytes())
+            if entry['host'] != host:
+                continue
+            if not {'source', 'identity', 'bytes', 'days', 'rule', 'category', 'policy', 'receipt', 'expires', 'exclude'} <= entry.keys():
+                raise ValueError('incomplete quarantine record')
+            source = Path(entry['source'])
+            held = held_path(source, record.stem)
+            retiring = held.parent.with_name(held.parent.name + '-purging') / held.name
+            path = retiring if retiring.parent.exists() else held
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                if source.parent.stat().st_dev != entry['identity'][0]:
+                    raise ValueError('source filesystem is unavailable')
+                restored = entry.get('restored')
+                if restored and time.time() < entry['restore_until']:
+                    try:
+                        info = os.lstat(restored)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        if [info.st_dev, info.st_ino] == entry['identity']:
+                            entries.append(dict(restore_hold=restored))
+                            continue
+                if retire:
+                    record.unlink()
+                if not restored:
+                    entries.append(dict(note=f'Quarantined item is missing: {path}'))
+                continue
+            if type(entry['bytes']) is not int or type(entry['days']) is not int or not all(
+                    isinstance(entry[key], str) for key in ('rule', 'category', 'policy')):
+                raise ValueError('invalid quarantine record')
+            entries.append(dict(entry, id=record.stem, path=str(path),
+                                policy_matches=policy is not None and entry['policy'] == quarantine_policy(source, policy),
+                                expired=entry['expires'] is not None and time.time() >= entry['expires']))
+        except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
+            entries.append(dict(note=f'Quarantine record held at {record}: {exc}'))
+    return entries
+
+
+def quarantine_action(request):
+    op = request['operation']
+    if op == 'quarantine-list':
+        return quarantine_entries(request['host_name'], retire=request.get('retire', False), policy=request['policy'])
+    record = quarantine_record(request['id'])
+    entry = json.loads(record.read_bytes())
+    if entry['host'] != request['host_name']:
+        raise ValueError('quarantine record belongs to another host')
+    source = Path(entry['source'])
+    held = held_path(source, request['id'])
+    retiring = held.parent.with_name(held.parent.name + '-purging') / held.name
+    if os.path.lexists(retiring.parent):
+        if os.path.lexists(held.parent):
+            raise ValueError('ambiguous local quarantine directories')
+        held = retiring
+    def check_identity():
+        info = held.lstat()
+        if not unlinked_path(held) or [info.st_dev, info.st_ino] != entry['identity']:
+            raise ValueError('quarantined item changed identity')
+    check_identity()
+    if op == 'quarantine-restore':
+        target = Path(request.get('to') or source)
+        if not unlinked_path(target) or overlap(target, held.parent):
+            raise ValueError('invalid restore destination')
+        entry.update(restored=str(target), restore_until=time.time() + entry['days'] * 86400)
+        save_quarantine_record(record, entry)
+        main(dict(operation='restore-publish', path=held, to=target, exclusive=True))
+        result = dict(restored=str(target), partial=entry.get('purge_started', False))
+    else:
+        if not entry.get('expires') or time.time() < entry['expires'] or entry['policy'] != quarantine_policy(source, request['policy']):
+            raise ValueError('quarantine retention or rules prevent purge')
+        locally_allowed(source, False, moved=True)
+        if protected_location(source, request['protected']) or excluded(source, entry['exclude']):
+            raise ValueError('original path is protected or excluded')
+        check_holds_above(source)
+        if str(held) != request['path']:
+            raise ValueError('quarantine location changed during protection checks')
+        guard(held, days=entry['days'], protected=request['protected'], broad=request['broad'], quarantined=True)
+        original = held_path(source, request['id'])
+        if held != retiring:
+            rename_new(held.parent, retiring.parent)
+            held = retiring
+        try:
+            check_identity()
+            current = guard(held, days=entry['days'], protected=request['protected'], broad=request['broad'], quarantined=True)
+            if current['digest'] != entry['digest'] or current['bytes'] > request['bytes']:
+                raise ValueError('quarantined item changed since removal')
+            if entry.get('receipt'):
+                if entry['receipt'] != request.get('receipt'):
+                    raise ValueError('preservation receipt changed before purge')
+                preservation_destination(held, entry['receipt'])
+            check_identity()
+            entry['purge_started'] = True
+            save_quarantine_record(record, entry)
+            delete(held)
+        except Exception:
+            rename_new(held.parent, original.parent)
+            raise
+        result = dict(bytes=current['bytes'])
+        record.unlink()
+    held.parent.rmdir()
+    return result
+
+
 def main(request):
     op = request['operation']
+    state = Path(expanded(QUARANTINE_STATE))
+    retire = op == 'quarantine-list' and request.get('retire')
+    if retire and not state.is_dir():
+        return []
+    if retire or op in ('quarantine-restore', 'quarantine-purge') or op == 'remove' and request.get('quarantine'):
+        if not unlinked_path(state):
+            raise ValueError('unsafe quarantine registry path')
+        state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name != 'nt' and (state.stat().st_uid != os.geteuid() or state.stat().st_mode & 0o022):
+            raise ValueError('quarantine registry is writable outside the owner')
+        with (state / 'entries.lock').open('ab') as stream:
+            lock(stream)
+            return run_operation(request)
+    return run_operation(request)
+
+
+def run_operation(request):
+    op = request['operation']
     path = request.get('path')
+    if op in ('quarantine-list', 'quarantine-restore', 'quarantine-purge'):
+        return quarantine_action(request)
+    if op == 'preservation':
+        return preservation_destination(Path(path), request['receipt'])
     if op == 'batch':
         results, rejected = [], set()
         activity = request.get('activity')
@@ -1590,7 +1860,8 @@ def main(request):
                 else:
                     candidates = [match]
                 for p in candidates:
-                    found.setdefault(p, []).append(pattern)
+                    if not any(part.casefold().startswith(QUARANTINE_PREFIX) for part in Path(p).parts):
+                        found.setdefault(p, []).append(pattern)
         keys = {p: real_key(p) for p in found}
         nested = lambda a, b: a == b or a.startswith(b.rstrip(os.sep) + os.sep) or b.startswith(a.rstrip(os.sep) + os.sep)
         related = {p: list(dict.fromkeys(found[p] + [pattern for q in found if nested(keys[p], keys[q])
@@ -1695,7 +1966,10 @@ def main(request):
         target = Path(request['to'])
         if os.path.lexists(target):
             raise FileExistsError('restore destination already exists')
-        os.rename(path, target)
+        if request.get('exclusive'):
+            rename_new(path, target)
+        else:
+            os.rename(path, target)
         return dict(restored=str(target))
     if op == 'restore-cleanup':
         import shutil
@@ -1779,7 +2053,7 @@ def main(request):
         def verify(source):
             if request.get('manifest') is None and request.get('security') is None:
                 return
-            current = tree(source, True)
+            current = tree(source, True, quarantined=True) if request.get('quarantine') else tree(source, True)
             for key, reason in (('manifest', 'source changed after verified NAS copy'),
                                 ('security', 'source security changed after verified NAS copy')):
                 actual = {Path(path).name + name[len(source.name):]: value for name, value in current[key].items()}
@@ -1821,6 +2095,7 @@ def main(request):
                 archived()
                 tree(Path(path))
                 check_holds_above(Path(path))
+                check_git_locks(*git_dirs(path))
                 git(state['common'], 'worktree', 'remove', '--', path)
             if branch and not keep_branch:
                 subprocess.run(['git', '--git-dir', state['common'], 'update-ref', '-d',
@@ -1830,14 +2105,56 @@ def main(request):
             import uuid
             source = Path(path)
             verify(source)
-            quarantine = source.with_name('.' + source.name + '.coldcleaner-removing-' + uuid.uuid4().hex)
-            os.rename(source, quarantine)
+            retention = request.get('quarantine')
+            ident = uuid.uuid4().hex
+            quarantine = source.with_name('.' + source.name + '.coldcleaner-removing-' + ident)
+            if retention:
+                for item in quarantine_entries(retention['host']):
+                    if 'restore_hold' in item and overlap(source, item['restore_hold']):
+                        raise ValueError('recently restored from quarantine: ' + item['restore_hold'])
+                days = retention['days']
+                if type(days) is not int or days < 1 or not request.get('manifest'):
+                    raise ValueError('quarantine requires a positive retention interval and verified source')
+                record = quarantine_record(ident)
+                quarantine = held_path(source, ident)
+                before = source.stat()
+                entry = dict(source=str(source), identity=[before.st_dev, before.st_ino],
+                             bytes=current['bytes'], receipt=request.get('receipt'), exclude=request.get('exclude', []),
+                             expires=None, **retention)
+                entry['policy'] = quarantine_policy(source, retention['policy'])
+                if record.exists():
+                    raise ValueError('quarantine ID already exists')
+                quarantine.parent.mkdir(mode=0o700)
+                try:
+                    save_quarantine_record(record, entry)
+                    rename_new(source, quarantine)
+                except Exception:
+                    record.unlink(missing_ok=True)
+                    quarantine.parent.rmdir()
+                    raise
+            else:
+                os.rename(source, quarantine)
             try:
                 verify(quarantine)
                 archived()
                 check_holds_above(source)
+                if receipt := request.get('receipt'):
+                    if preservation_destination(quarantine, receipt) != request['destination_identity']:
+                        raise ValueError('preservation destination changed before removal')
+                if retention:
+                    if not os.path.samestat(before, quarantine.stat()):
+                        raise ValueError('source changed identity during quarantine')
+                    entry['digest'] = tree(quarantine, quarantined=True)['digest']
+                    entry['expires'] = time.time() + days * 86400
+                    save_quarantine_record(record, entry)
+                    return dict(quarantine_path=str(quarantine), restore_id=f"quarantine:{entry['host']}:{ident}")
             except Exception:
-                os.rename(quarantine, source)
+                if retention:
+                    rename_new(quarantine, source)
+                    record.unlink()
+                    quarantine.parent.rmdir()
+                else:
+                    os.rename(quarantine, source)
                 raise
             delete(quarantine)
         return dict(removed=path, branch_removed=branch_removed, **recovery)

@@ -1,4 +1,5 @@
 archive_before_delete = "on"
+quarantine_days = 7
 backup_copy_check = "on"
 notes_vault = "on"
 wait_period_days = 7 # Omit to keep tier and per-entry idle windows, including the temp-folder minimum.
@@ -22,6 +23,7 @@ manual_notes = []
 
 [hosts.local]
 kind = "posix"
+managed_bytes_target = 10737418240 # Optional fleet reporting ceiling in bytes.
 max_items_per_run = 200
 max_gib_per_run = 100
 shared_roots = []

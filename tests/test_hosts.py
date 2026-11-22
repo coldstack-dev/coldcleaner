@@ -130,7 +130,7 @@ class ConfiguredHostTests(unittest.TestCase):
 
     def test_unknown_host_options_are_refused_after_rules_load(self):
         self.load('[hosts.mine]\nkind = "posix"')
-        for args, option, expected in ((['reclaim', '--json', '--host', 'missing'], '--host', 1),
+        for args, option, expected in ((['reclaim', '--json', '--host', 'missing'], '--host', 2),
                                        (['restore', 'archive-id', '--to-host', 'missing'], '--to-host', 2)):
             with self.subTest(option=option), patch.object(cli, 'run') as run, \
                     patch.object(cli.store, 'restore') as restore, contextlib.redirect_stdout(io.StringIO()) as output:
@@ -140,7 +140,7 @@ class ConfiguredHostTests(unittest.TestCase):
             run.assert_not_called()
             restore.assert_not_called()
             if '--json' in args:
-                self.assertEqual(json.loads(output.getvalue())['status'], 'refused')
+                self.assertEqual(json.loads(output.getvalue())['status'], 'incomplete')
 
     def test_custom_host_is_accepted_and_non_posix_restore_is_refused(self):
         self.load('[hosts.mine]\nkind = "posix"\n[hosts.bridge]\nkind = "powershell"\nssh = "bridge.example.invalid"')

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import locking
 from .disk import Usage
-from .report_files import RECLAIM, action_line, cell, paths
+from .report_files import RECLAIM, action_line, cell, paths, reported_action
 
 SKIP_ROWS = 20
 NOTE_PATHS = 5
@@ -49,7 +49,7 @@ class HostReport:
 
     @property
     def would_free(self):
-        return sum(row['bytes'] for row in self.actions if row['action'].startswith('would '))
+        return sum(row['bytes'] for row in self.actions if would_free(row))
 
     @property
     def acted_bytes(self):
@@ -72,7 +72,7 @@ def categories(reports):
     totals = {key: dict(items=0, reclaimable_bytes=0, acted_bytes=0) for key in CATEGORIES}
     for row in (row for report in reports for row in report.actions):
         key = category(row)
-        if key in totals and (row['action'].startswith('would ') or acted(row)):
+        if key in totals and (would_free(row) or acted(row)):
             totals[key]['items'] += 1
             totals[key]['reclaimable_bytes'] += row['bytes']
             totals[key]['acted_bytes'] += row['bytes'] if acted(row) else 0
@@ -86,8 +86,15 @@ def category_table(reports):
     return lines + ['']
 
 
+def would_free(row):
+    action = reported_action(row)
+    return action.startswith('would ') and action != 'would quarantine'
+
+
 def acted(row):
-    return not row['action'].startswith('would ') and row['action'] not in ('skip', 'error', 'report only', 'unreadable')
+    action = reported_action(row)
+    return not action.startswith('would ') and action not in ('skip', 'error', 'report only', 'unreadable',
+                                                             'quarantine', 'held in quarantine')
 
 
 def action_table(lines, rows):
@@ -322,10 +329,12 @@ def write(reports, directory, apply=False, code=None, manual_notes=(), rules_sha
     return path
 
 
-def dry_run_hosts(path, rules_sha256=None):
+def dry_run_hosts(path, rules_sha256=None, *, strict=False):
     try:
         text = Path(path).read_text(encoding='utf-8', errors='replace')
     except OSError:
+        if strict:
+            raise
         return set()
     lines = list(itertools.takewhile(lambda line: not line.startswith('## '), text.split('\n')))
     if not any(line.startswith('Mode: dry run.') for line in lines):

@@ -8,7 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 RECLAIM = 'Command: reclaim'
-FILENAME = r'\d{4}-\d{2}-\d{2}(?:-\d{6}-\d{6}-[0-9a-f]{32})?\.md'
+REPORT_DATE = r'\d{4}-\d{2}-\d{2}'
+RUN_SUFFIX = r'-\d{6}-\d{6}-[0-9a-f]{32}'
+FILENAME = rf'{REPORT_DATE}(?:{RUN_SUFFIX})?\.md'
+PLAN_FILENAME = rf'{REPORT_DATE}{RUN_SUFFIX}\.plan\.json'
 ACTION_KEYS = ('at', 'host', 'tier', 'action', 'path', 'bytes', 'reason')
 
 
@@ -16,8 +19,16 @@ def cell(value):
     return str(value).replace('|', '\\|').replace('\n', ' ').replace('\r', ' ')
 
 
+def reported_action(row):
+    if row.get('quarantine_path'):
+        return 'quarantine'
+    if row.get('quarantine_days') and row['action'] == 'would remove':
+        return 'would quarantine'
+    return row['action']
+
+
 def action_line(row):
-    values = [row[key] for key in ('tier', 'action', 'path', 'bytes', 'reason')]
+    values = [row['tier'], reported_action(row), row['path'], row['bytes'], row['reason']]
     return '| ' + ' | '.join(map(cell, values)) + ' |'
 
 
@@ -107,7 +118,7 @@ def read_source(directory, name):
                         at = timestamp(row['at'], 'local action log')
                         if start < at <= end:
                             projected = {key: row[key] for key in ACTION_KEYS}
-                            projected.update(at=at.isoformat(), path=row['path'].replace('\n', ' ').replace('\r', ' '),
+                            projected.update(action=reported_action(row), at=at.isoformat(), path=row['path'].replace('\n', ' ').replace('\r', ' '),
                                              reason=row['reason'].replace('\n', ' ').replace('\r', ' '))
                             rows.append(projected)
         return latest.name, text, rows

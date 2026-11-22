@@ -11,6 +11,7 @@ from pathlib import Path
 from . import collect, locking, metrics, reclaim, report, report_files, rules
 
 RUNS = 30
+REPORT_RETENTION = 30
 TOP = 5
 NAME = Path('fleet', 'summary.md')
 SNAPSHOT = NAME.with_name('waiting.json')
@@ -68,51 +69,92 @@ def disk_cells(values):
 
 
 def managed_history(directory, collected, names, now):
+    window = timedelta(days=30)
     samples = defaultdict(list)
+    latest_complete = {}
+    baselines = {}
+    pending = set()
     reports = [(path, None) for path in report.paths(directory)]
     reports.extend((path, host) for host, paths in collected.items() for path in paths)
-    for path, collected_host in sorted(reports, key=lambda item: item[0].stem):
+    for path, collected_host in sorted(reports, key=lambda item: item[0].stem, reverse=True):
         at = metrics.written(path)
-        if not now - timedelta(days=30) <= at <= now:
+        if at > now:
             continue
+        older = at < now - window
+        if older and not pending:
+            break
         lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
         if not report_files.is_apply(lines):
             continue
+        policy = next((match[1] for line in lines if
+                       (match := re.fullmatch(r'Rules: sha256 ([0-9a-f]{64})', line))), None)
         host = None
         for line in lines:
             if line.startswith('## '):
                 name = line[3:]
                 host = name if name in names and collected_host in (None, name) else None
-                if host:
-                    samples[host].append((at, None, 'unavailable'))
+                if host and not older:
+                    samples[host].append((at, None, 'unavailable', policy))
             elif host and (match := MANAGED_SAMPLE.fullmatch(line)):
-                samples[host][-1] = (at, int(match[1]), match[2])
+                value = (at, int(match[1]), match[2], policy)
+                if not older:
+                    samples[host][-1] = value
+                    if match[2] == 'complete':
+                        if host not in latest_complete and policy:
+                            pending.add(host)
+                        latest = latest_complete.setdefault(host, value)
+                        if policy == latest[3] and latest[0] - at >= window:
+                            pending.discard(host)
+                elif (host in pending and match[2] == 'complete'
+                      and policy == latest_complete[host][3] and latest_complete[host][0] - at >= window):
+                    baselines[host] = value
+                    pending.remove(host)
                 host = None
-    return samples
+    return samples, baselines
 
 
-def managed_section(directory, collected, names, now):
-    samples = managed_history(directory, collected, set(names), now)
+def managed_target(target, rows):
+    if target is None:
+        return 'no target'
+    if not rows or rows[0][2] != 'complete':
+        return f'{target} bytes (latest observation incomplete)'
+    difference = rows[0][1] - target
+    status = 'at target' if difference == 0 else f"{abs(difference)} bytes {'over' if difference > 0 else 'under'}"
+    return f'{target} bytes ({status})'
+
+
+def managed_trend(rows, baseline):
+    complete = [value for value in rows if value[2] == 'complete']
+    if not complete:
+        return '0 days covered'
+    end, last, _, policy = complete[0]
+    start, first, _, _ = baseline or next(
+        (value for value in reversed(complete) if policy and value[3] == policy), complete[0])
+    days = (end - start).days
+    span = f'{days} {"day" if days == 1 else "days"} covered'
+    change = f'30-day trend: {last - first:+d} bytes' if days >= 30 else 'insufficient coverage for trend'
+    return f'{start:%Y-%m-%d} → {end:%Y-%m-%d}: {span}, {change}'
+
+
+def managed_section(directory, collected, names, now, host_rules):
+    samples, baselines = managed_history(directory, collected, set(names), now)
     lines = ['', '## Managed agent-artifact bytes (30 days)', '',
              'Bytes estimated from measured file allocation in listed archive paths, worktrees and clones at the end of apply scans.',
-             'The trend uses complete observations. Partial and unavailable reports remain visible in coverage.', '',
-             '| Host | Latest apply observation | Complete observations | Coverage (complete / partial / unavailable) |',
-             '| --- | --- | --- | --- |']
+             'Trends compare complete observations with matching rules hashes. Counts cover the last 30 days.', '',
+             '| Host | Latest apply observation | Complete observations | Coverage (complete / partial / unavailable) | Target |',
+             '| --- | --- | --- | --- | --- |']
     for name in names:
         rows = samples[name]
         latest = 'no apply reports'
         if rows:
-            at, size, coverage = rows[-1]
+            at, size, coverage, _ = rows[0]
             amount = coverage if size is None else f'{report.size(size)}, {coverage}'
             latest = f'{at:%Y-%m-%d}: {amount}'
-        complete = [(at, size) for at, size, coverage in rows if coverage == 'complete']
-        trend = 'need two complete observations'
-        if len(complete) >= 2:
-            start, first = complete[0]
-            end, last = complete[-1]
-            trend = f'{start:%Y-%m-%d} → {end:%Y-%m-%d}: {last - first:+d} bytes'
-        counts = [sum(coverage == state for _, _, coverage in rows) for state in ('complete', 'partial', 'unavailable')]
-        lines.append('| ' + ' | '.join(map(report.cell, (name, latest, trend, ' / '.join(map(str, counts))))) + ' |')
+        counts = [sum(row[2] == state for row in rows) for state in ('complete', 'partial', 'unavailable')]
+        target = host_rules.get(name, {}).get('managed_bytes_target')
+        cells = (name, latest, managed_trend(rows, baselines.get(name)), ' / '.join(map(str, counts)),
+                 managed_target(target, rows))
+        lines.append('| ' + ' | '.join(map(report.cell, cells)) + ' |')
     return lines
 
 
@@ -304,11 +346,13 @@ def html(lines):
             '</style><main>' + ''.join(body) + '</main></html>')
 
 
-def render(config, now=None):
+def render(config, now=None, *, retained_since=None):
     now = now or datetime.now(timezone.utc)
     directory = config['report_dir']
     collected, invalid = collected_reports(config)
     since, runs = recent_runs(directory, collected.items())
+    if since is None and runs and retained_since is not None:
+        since = min(retained_since, runs[0][0])
     rows = metrics.actions(directory)
     current = current_collected(collected)
     current_rows = []
@@ -320,8 +364,12 @@ def render(config, now=None):
     names = [name for name, table in config['hosts'].items() if table['kind'] != 'wsl']
     names += sorted(({name for _, usage in runs for name in usage} | set(held) | set(acted)) - set(names))
     window = f'the last {len(runs)} reclaim --apply runs (from {runs[0][0]:%Y-%m-%d})' if runs else 'no reclaim --apply runs yet'
-    start = ('' if since or not runs else ' With 30 or fewer apply reports there is no earlier report to start from, '
-             'so reclaimed counts every logged action up to the newest one, including any from before these runs.')
+    start = ''
+    if since:
+        start = f' Reclaimed counts actions after {since:%Y-%m-%d %H:%M:%S} UTC.'
+    elif runs:
+        start = (' With 30 or fewer apply reports there is no earlier report to start from, '
+                 'so reclaimed counts every logged action up to the newest one.')
     lines = ['# coldcleaner fleet', '', f'Updated {now:%Y-%m-%d %H:%M} UTC. Disk used (after each run) and reclaimed cover {window}.{start} '
              'Held is the current state from the action log and held.json.', '', policy(config), '',
              '| Host | Disk used | Latest | Min | Max | Reclaimed GiB | Held | Held GiB | Roots | Archive patterns | Archive days overrides |',
@@ -331,7 +379,7 @@ def render(config, now=None):
         cells = [name, *disk_cells(values), metrics.gib(acted[name]), len(held[name]),
                  metrics.gib(sum(row['bytes'] for row in held[name])), *policy_cells(config['hosts'].get(name))]
         lines.append('| ' + ' | '.join(map(report.cell, cells)) + ' |')
-    lines.extend(managed_section(directory, collected, names, now))
+    lines.extend(managed_section(directory, collected, names, now, config['hosts']))
     if collected:
         lines.extend(['', '## Collected local reports', ''])
         for name, paths in collected.items():
@@ -350,7 +398,7 @@ def render(config, now=None):
     return lines
 
 
-def write(config, now=None, *, seconds=None, reports=None, plan=None, scanned=None):
+def write(config, now=None, *, seconds=None, reports=None, plan=None, scanned=None, run_report=None):
     path = Path(config['report_dir']) / NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     with (Path(config['report_dir']) / 'fleet.lock').open('a') as lock:
@@ -359,8 +407,14 @@ def write(config, now=None, *, seconds=None, reports=None, plan=None, scanned=No
             snapshot(config['report_dir'], reports, plan, config.get('rules_sha256'), scanned or {})
         if seconds is not None:
             event(config['report_dir'], seconds=seconds)
+        retained_since = None
+        if run_report is not None:
+            try:
+                retained_since = prune(config, run_report, plan)
+            except (OSError, ValueError, EOFError) as exc:
+                print(f'coldcleaner: report retention incomplete: {exc}', file=sys.stderr, flush=True)
         try:
-            lines = render(config, now)
+            lines = render(config, now, retained_since=retained_since)
         except Exception as exc:
             lines = ['# coldcleaner fleet', '', 'Fleet summary unavailable: ' + report.cell(exc), '']
         for target, content in [(path, '\n'.join(lines) + '\n'), (path.with_suffix('.html'), html(lines))]:
@@ -371,3 +425,64 @@ def write(config, now=None, *, seconds=None, reports=None, plan=None, scanned=No
             finally:
                 temporary.unlink(missing_ok=True)
     return path
+
+
+def prune(config, current_report, current_plan):
+    directory = Path(config['report_dir'])
+    policy = config.get('rules_sha256')
+    reports = [path for path in reversed(report.paths(directory)) if not path.is_symlink() and path.is_file()]
+    plans = sorted((path for path in directory.glob('*.plan.json')
+                    if re.fullmatch(report_files.PLAN_FILENAME, path.name)
+                    and not path.is_symlink() and path.is_file()), reverse=True)
+    if max(len(reports), len(plans)) <= REPORT_RETENTION:
+        return
+
+    kept_reports = {current_report}
+    kept_plans = {current_plan}
+    covered = set()
+    owned_reports = []
+    for path in reports:
+        with path.open(encoding='utf-8', errors='replace') as stream:
+            if not re.fullmatch(r'# coldcleaner [0-9-]+ [0-9:]+ UTC', stream.readline().rstrip()):
+                continue
+        owned_reports.append(path)
+        if policy:
+            hosts = report.dry_run_hosts(path, policy)
+            if hosts - covered:
+                kept_reports.add(path)
+                kept_plans.add(path.with_suffix('.plan.json'))
+                covered.update(hosts)
+
+    expired_plans = plans[REPORT_RETENTION:]
+    if expired_plans:
+        if policy:
+            for path in plans:
+                payload = json.loads(path.read_text(encoding='utf-8'))
+                if not isinstance(payload, dict):
+                    raise ValueError(f'{path} is not a reclaim dry-run plan')
+                if payload.get('rules_sha256') == policy:
+                    kept_plans.add(path)
+                    break
+
+        with reclaim.approvals(directory) as approvals, (directory / 'reclaim-actions.lock').open('a') as log_lock:
+            locking.lock(log_lock, shared=True)
+            state = read_snapshot(directory)
+            if not isinstance(state, dict) or not all(isinstance(row, dict) for row in state.values()):
+                raise ValueError('invalid fleet snapshot')
+            rows = (*approvals.values(), *state.values(), *metrics.read_actions(directory))
+            referenced_plans = set()
+            for row in rows:
+                reference = row.get('plan')
+                if reference is not None:
+                    if not isinstance(reference, str) or not reference:
+                        raise ValueError('invalid plan reference')
+                    referenced_plans.add(Path(reference).name)
+            for path in expired_plans:
+                if path not in kept_plans and path.name not in referenced_plans:
+                    path.unlink(missing_ok=True)
+
+    for path in owned_reports[REPORT_RETENTION:]:
+        if path not in kept_reports:
+            path.unlink(missing_ok=True)
+    if len(owned_reports) > REPORT_RETENTION:
+        return report_files.written(owned_reports[REPORT_RETENTION - 1])

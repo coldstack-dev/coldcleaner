@@ -26,6 +26,22 @@ from tests import outside_git
 outside_git.use()
 
 
+ORIGINAL_TRANSCRIPT = (b'{"type":"user","sessionId":"example","message":{"role":"user","content":"Visible question"}}\r\n'
+                       b'{"type":"summary","summary":"Only in raw file"}\r\n')
+
+
+def coldvault_fixture(path, store):
+    record = json.loads((Path(__file__).parent / 'fixtures' / 'coldvault-v2.json').read_bytes())
+    destination = store.parent / 'originals' / record['sha256']
+    destination.parent.mkdir(exist_ok=True)
+    destination.write_bytes(ORIGINAL_TRANSCRIPT)
+    record.update(path=str(path), destination=str(destination))
+    store.mkdir(exist_ok=True)
+    name = hashlib.sha256(f'test:{path}'.encode()).hexdigest() + '.json'
+    (store / name).write_text(json.dumps(record))
+    return destination
+
+
 class ReclaimTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1229,6 +1245,62 @@ class ReclaimTests(unittest.TestCase):
         self.assertIn('ABANDONED: IN USE: uncommitted work', items[0]['reason'])
         self.assertTrue(work.exists())
 
+    def test_origin_userinfo_is_absent_from_reclaim_output(self):
+        _, work = self.worktree()
+        self.git(work, 'commit', '--allow-empty', '-m', 'unpushed')
+        self.config['abandoned_idle_days'] = 0
+        self.config['hosts']['test']['roots'] = [str(work)]
+        real_git = reclaim_probe.git
+        userinfo = 'fake-user:fake-token'
+
+        def git(path, *args, **kwargs):
+            if args == ('remote', 'get-url', 'origin'):
+                return Mock(stdout=remote)
+            return real_git(path, *args, **kwargs)
+
+        with patch.object(reclaim_probe, 'git', side_effect=git):
+            for remote, expected in (
+                (f'https://{userinfo}@git.example.invalid/me/repo.git',
+                 'https://git.example.invalid/me/repo.git'),
+                (f'ssh://{userinfo}@git.example.invalid:2222/me/repo.git',
+                 'ssh://git.example.invalid:2222/me/repo.git'),
+                ('fake-user@localhost:me/repo.git', 'localhost:me/repo.git'),
+                ('git@github.com:me/repo.git', 'https://github.com/me/repo'),
+                (f'https://{userinfo}@github.com/me/repo.git', 'https://github.com/me/repo'),
+            ):
+                with self.subTest(expected=expected):
+                    preview = self.entry
+                    plan, items = self.abandoned_plan()
+                    row, = preview.actions
+                    self.assertFalse('fake-user' in json.dumps(row), 'action contains origin userinfo')
+                    self.assertFalse('fake-token' in plan.read_text(), 'plan contains origin userinfo')
+                    self.assertEqual(row['remote'], expected)
+                    self.assertIn(f'is not on {expected}', report.render([preview]))
+                    self.assertIn(f'is not on {expected}', items[0]['reason'])
+
+            self.assertEqual(self.approve(plan, items[0]['id'])[0], 0)
+            row = self.apply_worktrees()
+
+        self.assertEqual(row['action'], 'archive abandoned worktree; retain local branch')
+        logged = (self.root / 'reports' / 'reclaim-actions.jsonl').read_text()
+        receipt, = (self.root / 'nas').rglob('*.sha256.json')
+        for output in (logged, receipt.read_text()):
+            self.assertNotIn('fake-user', output)
+            self.assertNotIn('fake-token', output)
+        self.assertEqual(json.loads(logged)['remote'], 'https://github.com/me/repo')
+        self.assertEqual(json.loads(receipt.read_text())['git']['remote'], 'https://github.com/me/repo')
+        restored = self.restored_copy(work)
+        self.assertEqual(self.git(restored, 'remote', 'get-url', 'origin'), 'https://github.com/me/repo')
+
+        failed = subprocess.CalledProcessError(128, ['git', 'ls-remote'], stderr=f'fatal: {remote}'.encode())
+        with patch.object(hosts, 'controller', side_effect=[Mock(stdout=remote.encode()), failed]):
+            with self.assertRaisesRegex(RuntimeError, r'^Git origin lookup failed for https://github\.com/me/repo \(exit 128\)$'):
+                self.engine.origin_listing('me/repo')
+        invalid = remote.replace('github.com', 'github.com\uff0f')
+        with patch.object(hosts, 'controller', return_value=Mock(stdout=invalid.encode())):
+            with self.assertRaisesRegex(ValueError, '^origin must be GitHub$'):
+                self.engine.origin_listing('me/repo')
+
     def test_unapproved_abandoned_worktree_is_untouched_by_apply(self):
         _, work = self.abandoned_worktree()
         self.abandoned_plan()
@@ -1422,6 +1494,52 @@ class ReclaimTests(unittest.TestCase):
         self.apply_worktrees()
         self.assertTrue((work / 'untracked').is_file())
         self.assertTrue((admin / 'HEAD').is_file())
+
+    def test_git_transaction_locks_hold_linked_worktree(self):
+        repo, work = self.worktree()
+        admin = Path(self.git(work, 'rev-parse', '--path-format=absolute', '--git-dir'))
+        request = dict(operation='repo', path=str(work))
+        for lock in (admin / 'index.lock', admin / 'HEAD.lock', repo / '.git/refs/heads/main.lock'):
+            with self.subTest(lock=lock.name):
+                lock.touch()
+                try:
+                    with self.assertRaisesRegex(ValueError, 'Git transaction lock'):
+                        reclaim_probe.main(request)
+                finally:
+                    lock.unlink()
+        self.assertFalse(reclaim_probe.main(request)['dirty'])
+
+    def test_unreadable_git_transaction_lock_state_holds_linked_worktree(self):
+        repo, work = self.worktree()
+        common = repo / '.git'
+        scandir = os.scandir
+
+        def unreadable(path):
+            if Path(path) == common:
+                raise PermissionError('cannot scan Git directory')
+            return scandir(path)
+
+        with patch.object(os, 'scandir', side_effect=unreadable):
+            with self.assertRaisesRegex(ValueError, 'Git transaction lock state unreadable'):
+                reclaim_probe.main(dict(operation='repo', path=str(work)))
+
+    def test_git_transaction_lock_created_during_removal_holds_linked_worktree(self):
+        repo, work = self.worktree()
+        head = self.git(work, 'rev-parse', 'HEAD')
+        request = dict(operation='remove', path=str(work), head=head, branch='done',
+                       listing=self.git(repo, 'ls-remote', 'origin'),
+                       remote=self.git(repo, 'remote', 'get-url', 'origin'))
+        lock = repo / '.git/refs/heads/main.lock'
+        check_holds = reclaim_probe.check_holds_above
+
+        def acquire_lock(path):
+            check_holds(path)
+            lock.touch()
+
+        with patch.object(reclaim_probe, 'check_holds_above', side_effect=acquire_lock):
+            with self.assertRaisesRegex(ValueError, 'Git transaction lock'):
+                reclaim_probe.main(request)
+        self.assertTrue(work.is_dir())
 
     def test_abandoned_work_with_a_rebase_in_progress_stays_held(self):
         _, work = self.abandoned_worktree()
@@ -2378,6 +2496,191 @@ class ReclaimTests(unittest.TestCase):
             rows = self.archive_now()
         self.assertFalse(source.exists(), self.entry.actions)
         self.assertEqual(rows['fresh'], ('remove', 0))
+
+    def test_standalone_quarantine_restores_original_inode_and_defers_reclaimed_bytes(self):
+        source = self.aged('recover-me', 31)
+        inode = source.stat().st_ino
+        self.config.update(archive_before_delete='off')
+        self.config['hosts']['test']['archive'] = [str(source)]
+        self.archive_now()
+        row = self.entry.actions[-1]
+        self.assertEqual(self.entry.acted_bytes, 0, row)
+        held = Path(row['quarantine_path'])
+        self.assertIn(str(held), row['reason'])
+        self.assertEqual(held.stat().st_ino, inode)
+        self.assertFalse(source.exists())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch.object(rules, 'load', return_value=self.config):
+            self.assertEqual(cli.main(['restore', row['restore_id']]), 0)
+        self.assertIn(f'restored {row['restore_id']} to test:{source}', output.getvalue())
+        self.assertEqual(source.stat().st_ino, inode)
+        self.assertEqual((source / 'data').read_text(), 'recover-me')
+
+    def test_only_a_later_live_apply_purges_expired_quarantine(self):
+        source = self.aged('expired', 31)
+        self.config.update(archive_before_delete='off', quarantine_days=2)
+        self.config['hosts']['test']['archive'] = [str(source)]
+        self.archive_now()
+        self.assertIn('quarantine_path', self.entry.actions[-1])
+        held = Path(self.entry.actions[-1]['quarantine_path'])
+        size = self.entry.actions[-1]['bytes']
+        for days, apply, live, expected in [(1, True, ['archive'], 'held in quarantine'),
+                                             (3, False, ['archive'], 'would purge'),
+                                             (3, True, ['worktree'], 'would purge'),
+                                             (3, True, ['archive'], 'purge quarantine')]:
+            with self.subTest(days=days, apply=apply, live=live):
+                self.entry.actions.clear()
+                self.config['live'] = live
+                self.engine.apply = apply
+                with patch('time.time', return_value=time.time() + days * 86400), \
+                     patch.object(protect, 'collect', return_value=self.protection):
+                    self.engine.archives()
+                self.assertEqual([r['action'] for r in self.entry.actions], [expected])
+                purged = expected == 'purge quarantine'
+                self.assertEqual(self.entry.acted_bytes, size if purged else 0)
+                self.assertEqual(held.exists(), not purged)
+        self.entry.actions.clear()
+        self.archive_now()
+        self.assertEqual(self.entry.actions, [])
+
+    def test_unrelated_rules_edit_allows_expired_quarantine_purge(self):
+        source = self.aged('unrelated-rule', 31)
+        self.config.update(archive_before_delete='off')
+        self.config['hosts']['test']['archive'] = [str(source)]
+        self.archive_now()
+        self.assertIn('quarantine_path', self.entry.actions[-1])
+        held = Path(self.entry.actions[-1]['quarantine_path'])
+        self.config.update(alert_pct=90, rules_sha256='4' * 64)
+        self.config['hosts']['test']['archive'].append(str(self.root / 'unrelated-scratch'))
+        self.entry.actions.clear()
+        with patch('time.time', return_value=time.time() + 8 * 86400):
+            self.archive_now()
+        self.assertEqual(self.entry.actions[-1]['action'], 'purge quarantine')
+        self.assertFalse(held.exists())
+
+    def test_restored_item_gets_another_recovery_interval_before_reclaim(self):
+        source = self.aged('restore-grace', 31)
+        self.config.update(archive_before_delete='off', wait_period_days=0)
+        self.config.pop('nas_root')
+        self.config['hosts']['test']['archive'] = [str(source)]
+        self.archive_now()
+        row = self.entry.actions[-1]
+        self.assertIn('restore_id', row)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch.object(rules, 'load', return_value=self.config):
+            self.assertEqual(cli.main(['restore', '--local', row['restore_id']]), 0)
+        self.archive_now()
+        self.assertEqual(self.entry.actions[-1]['action'], 'skip')
+        self.assertTrue(source.exists())
+        with patch('time.time', return_value=time.time() + 8 * 86400):
+            self.archive_now()
+        self.assertFalse(source.exists())
+        self.assertNotEqual(self.entry.actions[-1]['restore_id'], row['restore_id'])
+
+    def test_bad_quarantine_record_is_isolated_and_missing_entry_retired_on_apply(self):
+        source = self.aged('missing-held', 31)
+        self.config.update(archive_before_delete='off')
+        self.config['hosts']['test']['archive'] = [str(source)]
+        self.archive_now()
+        row = self.entry.actions[-1]
+        self.assertIn('quarantine_path', row)
+        record = reclaim_probe.quarantine_record(row['restore_id'].split(':')[-1])
+        shutil.rmtree(Path(row['quarantine_path']).parent)
+        malformed = record.with_name('1' * 32 + '.json')
+        malformed.write_text('{')
+        self.engine.apply = False
+        self.engine.archives()
+        self.assertTrue(record.exists())
+        other = self.aged('next-item', 31)
+        self.config['hosts']['test']['archive'] = [str(other)]
+        self.archive_now()
+        self.assertFalse(record.exists())
+        self.assertTrue(malformed.exists())
+        self.assertIn('restore_id', self.entry.actions[-1])
+        self.assertTrue(any(str(malformed) in note for note in self.entry.notes))
+
+    def test_live_archive_purges_older_standalone_quarantine_after_policy_switch(self):
+        source = self.aged('policy-switch', 31)
+        self.config.update(archive_before_delete='off')
+        self.config['hosts']['test']['archive'] = [str(source)]
+        self.archive_now()
+        held = Path(self.entry.actions[-1]['quarantine_path'])
+        self.config['archive_before_delete'] = 'on'
+        self.entry.actions.clear()
+        with patch('time.time', return_value=time.time() + 8 * 86400):
+            self.archive_now()
+        self.assertFalse(held.exists())
+        self.assertEqual([row['action'] for row in self.entry.actions], ['purge quarantine'])
+
+    def test_standalone_preview_without_nas_or_live_archive_lists_recoverable_item(self):
+        source = self.aged('preview', 31)
+        self.config.update(archive_before_delete='off', live=[])
+        self.config.pop('nas_root')
+        self.config['hosts']['test']['archive'] = [str(source)]
+        self.engine.archives()
+        self.assertEqual(self.entry.actions[-1]['action'], 'would remove')
+        self.assertIn('Local quarantine', self.entry.actions[-1]['reason'])
+        self.assertTrue(source.exists())
+
+    def test_standalone_requires_no_overwrite_rename_before_moving_source(self):
+        source = self.aged('unsupported', 31)
+        self.config.update(archive_before_delete='off')
+        self.config['hosts']['test']['archive'] = [str(source)]
+        with patch.object(ctypes, 'CDLL', return_value=object()):
+            self.archive_now()
+        self.assertTrue(source.exists())
+        self.assertIn('atomic restore without overwrite is unavailable', self.entry.actions[-1]['reason'])
+        self.assertEqual((source / 'data').read_text(), 'unsupported')
+
+    def test_failed_quarantine_rename_keeps_original(self):
+        source = self.aged('cross-device', 31)
+        self.config.update(archive_before_delete='off')
+        self.config['hosts']['test']['archive'] = [str(source)]
+        with patch.object(reclaim_probe, 'rename_new', side_effect=OSError(18, 'Cross-device link')):
+            self.archive_now()
+        self.assertEqual((source / 'data').read_text(), 'cross-device')
+        self.assertEqual(self.entry.acted_bytes, 0)
+        self.assertIn('Cross-device link', self.entry.actions[-1]['reason'])
+
+    def test_expired_quarantine_with_changed_data_is_held_and_restore_refuses_overwrite(self):
+        source = self.aged('changed', 31)
+        self.config.update(archive_before_delete='off')
+        self.config['hosts']['test']['archive'] = [str(source)]
+        self.archive_now()
+        row = self.entry.actions[-1]
+        held = Path(row['quarantine_path'])
+        (held / 'data').write_text('edited')
+        self.entry.actions.clear()
+        with patch('time.time', return_value=time.time() + 8 * 86400):
+            self.archive_now()
+        self.assertIn('changed since removal', self.entry.actions[-1]['reason'])
+        source.write_text('new occupant')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch.object(rules, 'load', return_value=self.config):
+            self.assertNotEqual(cli.main(['restore', row['restore_id']]), 0)
+            target = self.root / 'recovered'
+            self.assertEqual(cli.main(['restore', row['restore_id'], '--to', str(target)]), 0)
+        self.assertIn(f'test:{target}', output.getvalue())
+        self.assertEqual(source.read_text(), 'new occupant')
+        self.assertEqual((target / 'data').read_text(), 'edited')
+
+    def test_quarantine_survives_parent_cleanup_and_revoked_host_policy(self):
+        source = self.aged('protected', 31)
+        self.config.update(archive_before_delete='off')
+        self.config['hosts']['test']['archive'] = [str(source)]
+        self.archive_now()
+        row = self.entry.actions[-1]
+        self.assertIn('quarantine_path', row)
+        held = Path(row['quarantine_path'])
+        self.config['hosts']['test']['archive'] = [str(source.parent)]
+        self.archive_now()
+        self.assertIn('local quarantine', self.entry.actions[-1]['reason'])
+        self.config['hosts']['test']['archive'] = [str(source)]
+        (self.root / '.config/coldcleaner/local.json').write_text('{"archive": []}')
+        with patch('time.time', return_value=time.time() + 8 * 86400):
+            self.archive_now()
+        self.assertIn('outside host-local policy', self.entry.actions[-1]['reason'])
+        self.assertEqual((held / 'data').read_text(), 'protected')
 
     def test_omitted_settings_keep_archive_copy_verification_and_wait(self):
         source = self.aged('old', 31)
@@ -3930,17 +4233,20 @@ class ReclaimTests(unittest.TestCase):
 
     def test_category_totals_match_in_report_header_and_json(self):
         self.worktree()
-        for name in ('scratch-a', 'bench-a', 'bench-b', 'transcripts'):
+        for name in ('scratch-a', 'bench-a', 'bench-b'):
             self.aged(name, 31)
         evidence = self.root / 'evidence'
         self.config['hosts']['test']['archive'] = [
             str(evidence / 'scratch-*'),
             dict(path=str(evidence / 'bench-*'), category='test-output'),
             dict(path=str(evidence / 'transcripts'), category='artifact', preservation='summary')]
-        store = self.root / 'memory'; store.mkdir()
+        transcript = evidence / 'transcripts'
+        transcript.write_bytes(ORIGINAL_TRANSCRIPT)
+        stamp = time.time() - 31 * 86400
+        os.utime(transcript, (stamp, stamp))
+        store = self.root / 'memory'
         self.config['memory_store'] = str(store)
-        (store / (hashlib.sha256(f"test:{evidence / 'transcripts'}".encode()).hexdigest() + '.json')).write_text(
-            json.dumps(dict(schema_version=1, host='test', path=str(evidence / 'transcripts'), summary='note')))
+        coldvault_fixture(transcript, store)
         self.config['live'] = ['archive']
         self.engine.apply = True
         with patch.object(protect, 'collect', return_value=self.protection):
@@ -4023,9 +4329,9 @@ class ReclaimTests(unittest.TestCase):
                 self.assertEqual((code, payload['status']), expected)
         refused = subprocess.run([sys.executable, '-m', 'coldcleaner', 'reclaim', '--json', '--bogus'],
                                  cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=30)
-        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertEqual(refused.returncode, 2, refused.stderr)
         self.assertEqual(json.loads(refused.stdout),
-                         dict(schema_version=1, status='refused', reason='invalid arguments; see stderr'))
+                         dict(schema_version=1, status='incomplete', reason='invalid arguments; see stderr'))
 
     def test_reclaim_json_unreadable_coverage_is_an_error(self):
         with patch.object(report, 'paths', side_effect=PermissionError('report directory unreadable')):
@@ -4214,11 +4520,13 @@ class ReclaimTests(unittest.TestCase):
                 patch.object(cli, 'run') as run, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(['reclaim', '--host', 'other', '--apply', '--i-reviewed', str(reviewed)]), 2)
         run.assert_not_called()
-        for bad in (apply_report, self.root / 'missing.md'):
-            with self.subTest(report=bad.name):
-                code, refused, ran = self.reclaim_main('--apply', '--i-reviewed', str(bad))
-                self.assertEqual((code, ran), (1, False))
-                self.assertIn(str(bad), refused['reason'])
+        code, refused, ran = self.reclaim_main('--apply', '--i-reviewed', str(apply_report))
+        self.assertEqual((code, ran), (1, False))
+        self.assertIn(str(apply_report), refused['reason'])
+        missing = self.root / 'missing.md'
+        code, summary, ran = self.reclaim_main('--apply', '--i-reviewed', str(missing))
+        self.assertEqual((code, summary['status'], ran), (2, 'incomplete', False))
+        self.assertIn(str(missing), summary['errors'][0])
         self.config['rules_sha256'] = 'f' * 64
         code, refused, ran = self.reclaim_main('--apply', '--i-reviewed', str(reviewed))
         self.assertEqual((code, refused['status'], ran), (1, 'refused', False))
@@ -4247,19 +4555,19 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual((summary['status'], summary['report'], summary['hosts']), ('incomplete', None, []))
         self.assertIn('Report not written: disk full', summary['errors'])
 
-    def test_invalid_arguments_with_json_still_print_one_refusal_object(self):
+    def test_invalid_arguments_with_json_print_one_error_object(self):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
             code = cli.main(['reclaim', '--json', '--host', 'invalid'])
-        self.assertEqual(code, 1)
-        self.assertEqual(json.loads(stdout.getvalue())['status'], 'refused')
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(stdout.getvalue())['status'], 'incomplete')
 
-    def test_bad_rules_file_is_refused_with_json_and_exit_one(self):
+    def test_missing_rules_file_exits_two_in_json(self):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             code = cli.main(['reclaim', '--json', '--rules', str(self.root / 'missing.toml')])
-        self.assertEqual(code, 1)
-        self.assertEqual(json.loads(stdout.getvalue())['status'], 'refused')
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(stdout.getvalue())['status'], 'incomplete')
 
     def test_cli_reclaim_selects_only_new_policy_and_default_two_hosts(self):
         with patch.object(rules, 'load', return_value=self.config), patch.object(cli, 'run', return_value=0) as run:

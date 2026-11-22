@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -112,6 +113,20 @@ class DoctorCase(unittest.TestCase):
         self.assertIn('PASS  git: /usr/bin/git', lines)
         self.assertEqual(lines[-1], 'doctor: 6 check(s) failed')
         self.assertEqual(fleet.operations, [('nas-box', 'activity')])
+
+    def test_json_reports_checks_and_distinguishes_findings(self):
+        rules = self.rules(self.directory / 'nas', self.directory / 'reports')
+        for missing, expected in (((), (0, 'ok')), (('git',), (1, 'attention'))):
+            with self.subTest(missing=missing):
+                code, lines = self.doctor(FakeFleet(), rules, '--host', 'nas-box', '--json', missing=missing)
+                payload = json.loads('\n'.join(lines))
+                self.assertEqual((code, payload['status']), expected)
+                self.assertEqual(payload['schema_version'], 1)
+                self.assertEqual([check['name'] for check in payload['checks']], [
+                    'python', 'zstd', 'git', 'gh auth', 'nas_root', 'report_dir', 'nas-box reach',
+                    'nas-box process inventory'])
+                self.assertEqual([check for check in payload['checks'] if not check['ok']],
+                                 [dict(name='git', ok=False, detail='git not found on PATH')] if missing else [])
 
     def test_host_option_checks_only_that_host(self):
         rules = self.rules(self.directory / 'nas', self.directory / 'reports')

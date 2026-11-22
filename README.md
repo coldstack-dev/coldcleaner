@@ -33,31 +33,64 @@ Other ways to install (pipx, pip in a virtual environment, or running from the c
 ## Quick start (one machine)
 
 ```sh
-uv tool install git+https://github.com/TayHCode/coldcleaner@v0.3.2
+uv tool install git+https://github.com/TayHCode/coldcleaner@v0.3.3
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner"
-[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml" ] || { curl -fsSL https://raw.githubusercontent.com/TayHCode/coldcleaner/v0.3.2/rules.example.toml -o "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" && mv "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml"; }
+[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml" ] || { curl -fsSL https://raw.githubusercontent.com/TayHCode/coldcleaner/v0.3.3/rules.example.toml -o "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" && mv "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml"; }
 coldcleaner doctor
 coldcleaner reclaim --host local
 ```
 
-1. `uv tool install` adds the v0.3.2 command to `~/.local/bin`. To install from a clone, run `uv tool install .`.
+1. `uv tool install` adds the v0.3.3 command to `~/.local/bin`. To install from a clone, run `uv tool install .`.
 2. Download the example to `~/.config/coldcleaner/rules.toml` or `$XDG_CONFIG_HOME/coldcleaner/rules.toml`. An existing file is kept.
-3. `doctor` reports PASS or FAIL for each prerequisite. Exit 1 means a check failed. You can still dry-run.
+3. `doctor` reports PASS or FAIL for each prerequisite. Add `--json` for structured check results. Exit 1 means a check failed. You can still dry-run.
 4. `reclaim --host local` writes a dry-run report with proposed actions and skip reasons. It prints the report path, disk use and estimated savings.
 
-The example rules list no folders. Add your own below.
+The example rules list no folders.
+
+## Host-local policy
+
+Before enabling cleanup, create `~/.config/coldcleaner/local.json` on each host. It allows worktrees under `roots` and folders matching `archive` globs. Without it, the host keeps every candidate.
+
+```json
+{"roots": ["~/projects"], "archive": ["~/projects/*/.scratch"]}
+```
+
+## Sudo
+
+Coldcleaner checks running processes before removal. On Linux and macOS, non-root users need passwordless `sudo -n` for this inventory. If sudo fails, coldcleaner skips candidates with `IN USE: process inventory needs passwordless sudo (see README#sudo)`. If an unprivileged container reports `process inventory incomplete: /proc not readable`, run coldcleaner on the container's host.
+
+On Linux, install the read-only scan from the repository folder. Repeat this after every upgrade.
+
+```sh
+python3 -c 'import coldcleaner.reclaim_probe as p; print(p.PROC_SCAN, end="")' | sudo install -D -m 0644 /dev/stdin /usr/local/libexec/coldcleaner-proc-scan.py
+```
+
+This needs `python3` to be Python 3.14. If your Python 3.14 came from uv, start the line with `"$(uv tool dir)/coldcleaner/bin/python" -c` instead of `python3 -c`. For a remote host, pipe into `ssh HOST 'sudo install -D -m 0644 /dev/stdin /usr/local/libexec/coldcleaner-proc-scan.py'` instead.
+
+Then add this rule with `sudo visudo -f /etc/sudoers.d/coldcleaner`. Replace `alice` with the user that runs coldcleaner (the SSH user, for a remote host), and `/usr/bin/python3` with the output of `command -v python3` on that host:
+
+```text
+alice ALL=(root) NOPASSWD: /usr/bin/python3 -I /usr/local/libexec/coldcleaner-proc-scan.py /proc
+```
+
+On macOS, the check runs `lsof` and `ps`:
+
+```text
+alice ALL=(root) NOPASSWD: /usr/sbin/lsof -nP -Fn, /bin/ps -axww -o command\=
+```
 
 ## Turn cleanup on
 
 `coldcleaner init` asks six policy questions and backs up edited rules. Blank answers retain settings; `coldcleaner init --yes` keeps current settings without prompting. It selects no new paths.
 
-Open the rules file you just copied (`~/.config/coldcleaner/rules.toml`, or under `$XDG_CONFIG_HOME`) and work through these steps in order:
+Open the rules file you copied during quick start.
 
 1. Under `[hosts.local]`, set `roots` to the folders that hold your Git repositories, for example `roots = ["~/projects"]`. Coldcleaner finds worktrees inside them.
 2. Set `archive` to the scratch or temp folders you want archived and removed once they are idle, for example `archive = ["~/projects/*/.scratch"]`.
 3. Set `nas_root` to the folder where archives go. The name comes from NAS (network-attached storage): the folder must be on a network share (NFS or SMB), or on a second drive that you name in `local_archive_mount`. See [Archive storage](docs/reference.md#archive-storage).
-4. Set a live tier, for example `live = ["archive"]`. Run `coldcleaner check-rules` and `coldcleaner reclaim --host local`. Review the dry-run report.
-5. Run `coldcleaner reclaim --host local --apply` if the report looks right. Confirm `Mode: apply` before scheduling cleanup.
+4. Set a live tier, for example `live = ["archive"]`. Run `coldcleaner check-rules` and `coldcleaner doctor --host local`. Both accept `--json` for structured results. Resolve any failures, then run `coldcleaner reclaim --host local` to write a fresh dry-run report.
+5. Open the report at the path printed by `reclaim`. Pick a candidate and check its path, proposed action or skip reason, and whether the disposition matches your intent. Review the other proposed actions too. If anything looks wrong, correct the setup and rerun the dry run.
+6. Run `coldcleaner reclaim --host local --apply --i-reviewed REPORT`, replacing `REPORT` with the path to the dry-run report you reviewed. Confirm `Mode: apply` and check the result before scheduling cleanup.
 
 `--apply` requires a live tier and a current-rules dry run per host. Worktree cleanup uses `gh` to verify published commits and pull requests.
 
@@ -78,39 +111,7 @@ After a rules change, the nightly records a dry run for each uncovered host. The
 
 In text mode, exit code 0 means the run completed, including when `--apply` recorded a dry run. Exit code 1 means a step failed or an SSH outage left the scan without a completed host. Exit code 2 means the command refused to run, for example because of bad rules or arguments. Exit code 3 means a host needs attention for an isolated SSH outage, missing apply coverage, disk use at or above `alert_pct` (80% in the example), or at least 1 GiB skipped due to the per-run deletion limit.
 
-Scripts using `reclaim --json` get exit code 0 for success, 1 for attention or refusal, and 2 for an incomplete run. See the [JSON schema](docs/reference.md#calling-it-from-another-tool).
-
-## Host-local policy
-
-Each host removes only what its own `~/.config/coldcleaner/local.json` allows, whatever the controller asks: worktrees under its `roots`, folders matching its `archive` globs. Without it, nothing is removed there.
-
-```json
-{"roots": ["~/projects"], "archive": ["/tmp/*"]}
-```
-
-## Sudo
-
-Before removing anything, coldcleaner checks that no running program uses it. Only root can see every program's open files, so a non-root run uses `sudo -n` on Linux and macOS, which never asks for a password. Without passwordless sudo, nothing is removed, and each candidate is skipped with `IN USE: process inventory needs passwordless sudo (see README#sudo)`. Root inside an unprivileged container (LXC, Incus, rootless Docker) still cannot read all of `/proc`, so there candidates are skipped as `process inventory incomplete: /proc not readable`. Run coldcleaner on the container's host instead.
-
-On Linux, the narrowest rule lets your user run one root-owned, read-only scan and nothing else. From the repository folder, install the scan (repeat this after every upgrade; until you do, candidates are skipped with the sudo message):
-
-```sh
-python3 -c 'import coldcleaner.reclaim_probe as p; print(p.PROC_SCAN, end="")' | sudo install -D -m 0644 /dev/stdin /usr/local/libexec/coldcleaner-proc-scan.py
-```
-
-This needs `python3` to be Python 3.14. If your Python 3.14 came from uv, start the line with `"$(uv tool dir)/coldcleaner/bin/python" -c` instead of `python3 -c`. For a remote host, pipe into `ssh HOST 'sudo install -D -m 0644 /dev/stdin /usr/local/libexec/coldcleaner-proc-scan.py'` instead.
-
-Then add this rule with `sudo visudo -f /etc/sudoers.d/coldcleaner`. Replace `alice` with the user that runs coldcleaner (the SSH user, for a remote host), and `/usr/bin/python3` with the output of `command -v python3` on that host:
-
-```text
-alice ALL=(root) NOPASSWD: /usr/bin/python3 -I /usr/local/libexec/coldcleaner-proc-scan.py /proc
-```
-
-On macOS, the check runs `lsof` and `ps`:
-
-```text
-alice ALL=(root) NOPASSWD: /usr/sbin/lsof -nP -Fn, /bin/ps -axww -o command\=
-```
+With `--json`, `reclaim`, `doctor` and `check-rules` return one versioned result. Exit 0 means success, 1 means a finding or refusal, and 2 means a usage or runtime error. See the [JSON schema](docs/reference.md#calling-it-from-another-tool).
 
 ## More
 

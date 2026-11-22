@@ -5,6 +5,7 @@ import math
 import os
 import re
 import tomllib
+from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from . import hosts
@@ -27,7 +28,7 @@ TOP_LEVEL_KEYS = frozenset({
     'nas_root', 'local_archive_mount', 'report_dir', 'live', 'approval',
     'already_compressed_extensions', 'hosts', 'reclaim_hosts', 'collect_hosts', 'actions_log_mb', 'manual_notes',
     'max_items_per_run', 'max_gib_per_run', 'attention_note', 'memory_store',
-    'archive_before_delete', 'backup_copy_check', 'notes_vault', 'wait_period_days',
+    'archive_before_delete', 'backup_copy_check', 'notes_vault', 'wait_period_days', 'quarantine_days',
 })
 REQUIRED_KEYS = (
     'alert_pct', 'worktree_idle_days', 'archive_idle_days', 'live', 'nas_root', 'report_dir',
@@ -35,7 +36,7 @@ REQUIRED_KEYS = (
 )
 LOCAL_POLICY_KEYS = {'report_dir', 'archive_before_delete', 'live'}
 HOST_KEYS = frozenset({'roots', 'archive', 'shared_roots', 'protected', 'exclude', 'kind', 'ssh', 'distro',
-                       'max_items_per_run', 'max_gib_per_run'} | LOCAL_POLICY_KEYS)
+                       'max_items_per_run', 'max_gib_per_run', 'managed_bytes_target'} | LOCAL_POLICY_KEYS)
 ARCHIVE_ENTRY_KEYS = ('path', 'days', 'backup', 'exclude', 'category', 'approval', 'preservation', 'age_days')
 APPROVAL_TIERS = ('worktree', 'clone', 'archive')
 BACKUPS = ('nas', 'none-if-regenerable')
@@ -60,6 +61,10 @@ def is_windows_temp(path):
     return any(normal == folder or normal.startswith(folder + '\\') for folder in WINDOWS_TEMP_FOLDERS)
 
 
+class LocalHostError(ValueError):
+    pass
+
+
 def load(path=DEFAULT_PATH, local=None, report_dir=None):
     raw = Path(path).read_bytes()
     data = tomllib.loads(raw.decode())
@@ -68,7 +73,8 @@ def load(path=DEFAULT_PATH, local=None, report_dir=None):
     unknown = set(data) - TOP_LEVEL_KEYS
     if unknown:
         raise ValueError(f'unknown rules option: {sorted(unknown)[0]}; known options: {", ".join(sorted(TOP_LEVEL_KEYS))}')
-    missing = [key for key in REQUIRED_KEYS if key not in data]
+    missing = [key for key in REQUIRED_KEYS if key not in data
+               and not (key == 'nas_root' and data.get('archive_before_delete') == 'off' and not data.get('local_archive_mount'))]
     if missing:
         raise ValueError(f'missing required key {missing[0]}')
     host_rules = data['hosts']
@@ -98,6 +104,7 @@ def load(path=DEFAULT_PATH, local=None, report_dir=None):
     for key in ('archive_before_delete', 'backup_copy_check', 'notes_vault'):
         if key in data and data[key] not in ('on', 'off'):
             raise ValueError(f'{key} must be on or off')
+    positive_limit('quarantine_days', data.setdefault('quarantine_days', 7))
     if 'wait_period_days' in data:
         value = data['wait_period_days']
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
@@ -183,7 +190,7 @@ def load(path=DEFAULT_PATH, local=None, report_dir=None):
         for key in ('ssh', 'distro'):
             if key in config and (not isinstance(config[key], str) or not config[key].strip()):
                 raise ValueError(f'{name}.{key} must be a nonempty string, got {config[key]!r}')
-        for key in LIMIT_KEYS:
+        for key in (*LIMIT_KEYS, 'managed_bytes_target'):
             if key in config:
                 positive_limit(f'{name}.{key}', config[key])
         registry[name] = hosts.Host(name, kind, None if name == local else config.get('ssh'), config.get('distro'))
@@ -211,7 +218,7 @@ def load(path=DEFAULT_PATH, local=None, report_dir=None):
                 if location:
                     raise ValueError(f'{name}.{key}[{index}]: overlaps protected location {location!r}, got {path!r}')
     if local is not None and (local not in registry or registry[local].kind != local_kind):
-        raise ValueError(f'--local needs a configured {local_kind} host, got {local!r}; known hosts: {", ".join(sorted(registry))}')
+        raise LocalHostError(f'--local needs a configured {local_kind} host, got {local!r}; known hosts: {", ".join(sorted(registry))}')
     if local_kind == 'powershell':
         local_names = [name for name, host in registry.items() if host.ssh is None]
         if len(local_names) > 1:
@@ -341,18 +348,21 @@ def preservation_receipt(config, host, path, policy):
         raise ValueError(f'no preservation receipt {name} in {config["memory_store"]}') from None
     except (OSError, ValueError):
         raise ValueError(f'invalid preservation receipt {name}') from None
-    if not isinstance(receipt, dict) or set(receipt) != {'schema_version', 'host', 'path', policy} \
-            or type(receipt['schema_version']) is not int or receipt['schema_version'] != 1 \
-            or receipt['host'] != host or receipt['path'] != path or not isinstance(receipt[policy], str) \
-            or not (re.fullmatch('[0-9a-f]{64}', receipt[policy]) if policy == 'sha256' else receipt[policy].strip()):
+    fields = {'schema_version', 'host', 'path', 'sha256', 'destination', 'verified_at'}
+    if isinstance(receipt, dict) and (receipt.get('schema_version') == 1 or 'summary' in receipt and 'sha256' not in receipt):
+        raise ValueError('not eligible: legacy or summary-only preservation receipt')
+    if not isinstance(receipt, dict) or set(receipt) != fields \
+            or type(receipt['schema_version']) is not int or receipt['schema_version'] != 2 \
+            or receipt['host'] != host or receipt['path'] != path \
+            or not isinstance(receipt['sha256'], str) or not re.fullmatch('[0-9a-f]{64}', receipt['sha256']) \
+            or not isinstance(receipt['destination'], str) or not isinstance(receipt['verified_at'], str) \
+            or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', receipt['verified_at']):
         raise ValueError(f'invalid preservation receipt {name} for {policy} policy')
+    try:
+        datetime.strptime(receipt['verified_at'], '%Y-%m-%dT%H:%M:%SZ')
+    except ValueError:
+        raise ValueError(f'invalid preservation receipt {name}: verified_at') from None
     return receipt
-
-
-def content_hash(manifest):
-    if len(manifest) == 1 and None not in manifest.values():
-        return next(iter(manifest.values()))
-    return hashlib.sha256(json.dumps(sorted(manifest.items())).encode()).hexdigest()
 
 
 def positive_limit(key, value):

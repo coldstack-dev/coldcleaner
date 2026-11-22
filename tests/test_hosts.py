@@ -3,6 +3,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 import subprocess
 from unittest.mock import patch
@@ -50,7 +51,8 @@ class HostTests(unittest.TestCase):
             hosts.run(local, 'Get-PSDrive C')
         self.assertEqual(run.call_args.args[0], ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', '-'])
         self.assertEqual(run.call_args.kwargs['input'], b'Get-PSDrive C')
-        command = hosts.python_argv(local)
+        with patch.object(hosts, 'os', SimpleNamespace(name='posix')):
+            command = hosts.python_argv(local)
         self.assertEqual(command[:2], ['python.exe', '-c'])
         self.assertNotIn('ssh', command)
 
@@ -128,12 +130,12 @@ class ConfiguredHostTests(unittest.TestCase):
 
     def test_unknown_host_options_are_refused_after_rules_load(self):
         self.load('[hosts.mine]\nkind = "posix"')
-        for args, option in ((['reclaim', '--json', '--host', 'missing'], '--host'),
-                             (['restore', 'archive-id', '--to-host', 'missing'], '--to-host')):
+        for args, option, expected in ((['reclaim', '--json', '--host', 'missing'], '--host', 1),
+                                       (['restore', 'archive-id', '--to-host', 'missing'], '--to-host', 2)):
             with self.subTest(option=option), patch.object(cli, 'run') as run, \
                     patch.object(cli.store, 'restore') as restore, contextlib.redirect_stdout(io.StringIO()) as output:
                 code = cli.main(args + ['--rules', str(self.path)])
-            self.assertEqual(code, 2)
+            self.assertEqual(code, expected)
             self.assertIn('unknown ' + option + ' host: missing; known hosts: mine', output.getvalue())
             run.assert_not_called()
             restore.assert_not_called()
@@ -155,6 +157,52 @@ class ConfiguredHostTests(unittest.TestCase):
             self.load('[hosts.mine]\nkind = "posix"\nroots = ["~/.local/share/coldcleaner"]')
         config = self.load('[hosts.remote]\nkind = "posix"\nssh = "remote.example.invalid"\nroots = ["~/.local/share/coldcleaner"]')
         self.assertEqual(config['hosts']['remote']['roots'], ['~/.local/share/coldcleaner'])
+
+    def main(self, *args):
+        with contextlib.redirect_stdout(io.StringIO()) as output, patch.object(cli, 'run', return_value=0) as run:
+            code = cli.main(['reclaim', '--rules', str(self.path), *args])
+        return code, output.getvalue(), run
+
+    def test_local_runs_the_named_host_on_this_machine_without_ssh(self):
+        self.load('[hosts.remote]\nkind = "posix"\nssh = "remote.example.invalid"')
+        code, _, run = self.main('--host', 'remote', '--local', '--json')
+        self.assertEqual(code, 0)
+        self.assertEqual(run.call_args.args[1], [hosts.Host('remote', 'posix')])
+
+    def test_windows_controller_accepts_a_local_powershell_host(self):
+        self.path.write_text(self.head + '\n[hosts.native]\nkind = "powershell"\n')
+        with patch.object(rules, 'os', SimpleNamespace(name='nt')):
+            try:
+                rules.load(self.path, local='native')
+            except ValueError as exc:
+                self.fail(str(exc))
+        self.assertEqual(hosts.HOSTS['native'], hosts.Host('native', 'powershell'))
+
+    def test_windows_controller_refuses_two_names_for_the_same_machine(self):
+        self.path.write_text(self.head + '\n[hosts.native]\nkind = "powershell"\n'
+                             '\n[hosts.other]\nkind = "powershell"\nssh = "windows.example.invalid"\n')
+        with patch.object(rules, 'os', SimpleNamespace(name='nt')):
+            with self.assertRaisesRegex(ValueError, 'only one local PowerShell host'):
+                rules.load(self.path, local='other')
+        self.assertEqual(hosts.HOSTS, {})
+
+    def test_local_is_refused_without_a_posix_host(self):
+        self.load('[hosts.remote]\nkind = "posix"\nssh = "remote.example.invalid"\n'
+                  '[hosts.bridge]\nkind = "powershell"\nssh = "bridge.example.invalid"')
+        for args, reason in ((['--local'], '--local needs --host'),
+                             (['--local', '--host', 'bridge'], "--local needs a configured posix host, got 'bridge'")):
+            with self.subTest(args=args):
+                code, output, run = self.main(*args)
+                self.assertEqual(code, 2)
+                self.assertIn(reason, output)
+                run.assert_not_called()
+
+    def test_local_run_protects_this_machines_output_paths(self):
+        self.load('[hosts.remote]\nkind = "posix"\nssh = "remote.example.invalid"\nroots = ["~/.local/share/coldcleaner"]')
+        code, output, run = self.main('--host', 'remote', '--local')
+        self.assertEqual(code, 2)
+        self.assertIn('remote.roots[0]: would clean up nas_root', output)
+        run.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

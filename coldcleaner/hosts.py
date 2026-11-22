@@ -84,6 +84,14 @@ def popen(host: Host, script: str, **kwargs) -> subprocess.Popen:
     return subprocess.Popen(argv(host, script), **kwargs)
 
 
+def controller(args, *, check=True, timeout=180, git_noninteractive=False):
+    if os.name == 'nt':
+        env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GCM_INTERACTIVE='Never') if git_noninteractive else None
+        return subprocess.run(args, check=check, timeout=timeout, capture_output=True, env=env)
+    prefix = 'GIT_TERMINAL_PROMPT=0 ' if git_noninteractive else ''
+    return run(LOCAL, prefix + shlex.join(args), check=check, timeout=timeout)
+
+
 def python_argv(host):
     if host.kind == 'wsl':
         raise ValueError('Windows WSL execution is retired')
@@ -94,7 +102,7 @@ def python_argv(host):
         return [*SSH, host.ssh, 'wsl.exe -d ' + host.distro + ' -u root -e python3 -c "' + code + '"']
     if host.kind == 'powershell':
         if host.ssh is None:
-            return ['python.exe', '-c', code]
+            return [sys.executable if os.name == 'nt' else 'python.exe', '-c', code]
         return [*SSH, host.ssh, 'python.exe -c "' + code + '"']
     return argv(host, 'python3 -c ' + shlex.quote(code))
 

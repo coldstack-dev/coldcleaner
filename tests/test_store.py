@@ -81,7 +81,7 @@ class StoreTests(unittest.TestCase):
                 if member:
                     args += ['--member', member]
                 output = io.StringIO()
-                with patch.object(cli.rules, 'load', return_value=dict(nas_root=str(self.nas))), \
+                with patch.object(cli.rules, 'load', return_value=dict(nas_root=str(self.nas), report_dir=str(self.root / 'reports'))), \
                         contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
                     try:
                         result = cli.main(args)

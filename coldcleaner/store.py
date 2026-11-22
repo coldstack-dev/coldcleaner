@@ -1,18 +1,18 @@
 import csv
-import fcntl
 import os
 import re
 import shlex
 import subprocess
 import tarfile
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-from . import hosts
+from . import locking, hosts
 
 
 @dataclass(frozen=True)
@@ -56,10 +56,19 @@ def _source(path):
 
 
 @contextmanager
-def _index_lock(root):
+def _index_lock(root, deadline=None):
     root.mkdir(parents=True, exist_ok=True)
     with (root / ".index.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if deadline is None:
+            locking.lock(lock)
+        while deadline is not None:
+            try:
+                locking.lock(lock, blocking=False)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("run deadline reached while another run held the NAS index lock") from None
+                time.sleep(1)
         yield
 
 
@@ -82,11 +91,31 @@ def _read_index(root):
 
 
 def _sync_directory(path):
+    if os.name == 'nt':
+        return
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _publish(source, target, *, replace=False):
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+
+        move = ctypes.WinDLL('kernel32', use_last_error=True).MoveFileExW
+        move.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+        move.restype = wintypes.BOOL
+        write_through = 8
+        replace_existing = 1
+        if not move(str(source), str(target), write_through | (replace_existing if replace else 0)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    elif replace:
+        os.replace(source, target)
+    else:
+        os.rename(source, target)
 
 
 def _write_index(root, records):
@@ -100,7 +129,7 @@ def _write_index(root, records):
             writer.writerows([getattr(record, key) for key in _COLUMNS] for record in records)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, root / "INDEX.csv")
+        _publish(temporary, root / "INDEX.csv", replace=True)
         _sync_directory(root)
     finally:
         if temporary is not None:

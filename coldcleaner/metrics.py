@@ -1,18 +1,18 @@
-import fcntl
 import gzip
-import itertools
 import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import report, store
+from . import locking, report, store
+from .report_files import is_apply, log_paths, timestamp, written
 
 DAYS = 7
 TIERS = ('worktree', 'clone', 'archive')
 USAGE = re.compile(r'(Before|After): ([\d.]+)% \([\d.]+ GiB \((\d+) bytes\) of [\d.]+ GiB \((\d+) bytes\)\)')
 DRILL_RESULTS = ('pass', 'fail')
+HUMAN_COMMANDS = ('approve', 'restore', 'find')
 
 
 @dataclass
@@ -25,6 +25,7 @@ class HostMetrics:
     df_freed: int = 0
     used: list = field(default_factory=list)
     restored: int = 0
+    human_actions: int = 0
     drill: tuple | None = None
     held_now: set | None = None
     held_starts: list = field(default_factory=list)
@@ -35,27 +36,12 @@ class HostMetrics:
         return len(self.acted) / (len(self.acted) + waiting) if self.acted or waiting else None
 
 
-def timestamp(value, where):
-    try:
-        moment = datetime.fromisoformat(value)
-    except (TypeError, ValueError):
-        moment = None
-    if moment is None or moment.tzinfo is None:
-        raise ValueError(f'{where}: "at" must be an ISO timestamp with a time zone, got {value!r}')
-    return moment
-
-
-def log_paths(directory):
-    live = directory / 'reclaim-actions.jsonl'
-    return sorted(directory.glob('reclaim-actions-*.jsonl.gz')) + ([live] if live.exists() else [])
-
-
 def actions(directory):
     lock = Path(directory) / 'reclaim-actions.lock'
     if not lock.exists():
         return read_actions(Path(directory))
     with lock.open() as stream:
-        fcntl.flock(stream, fcntl.LOCK_SH)
+        locking.lock(stream, shared=True)
         return read_actions(Path(directory))
 
 
@@ -117,14 +103,6 @@ def add_held(found, held_since, directory, current):
         entry.held_starts = [held_since.get((name, path)) for path in paths]
 
 
-def written(path):
-    try:
-        moment = datetime.strptime(path.stem[:24], '%Y-%m-%d-%H%M%S-%f')
-    except ValueError:
-        moment = datetime.strptime(path.stem[:10], '%Y-%m-%d')
-    return moment.replace(tzinfo=timezone.utc)
-
-
 def add_usage(found, host, before, after):
     entry = found.setdefault(host, HostMetrics())
     entry.df_freed += before[1] - after[1]
@@ -133,8 +111,7 @@ def add_usage(found, host, before, after):
 
 def apply_usage(path):
     lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
-    header = list(itertools.takewhile(lambda line: not line.startswith('## '), lines))
-    if report.RECLAIM not in header or not any(line.startswith('Mode: apply') for line in header):
+    if not is_apply(lines):
         return None
     found, host, usage = {}, None, {}
     for line in lines + ['## ']:
@@ -183,6 +160,31 @@ def add_drills(found, directory):
             entry.drill = at, row['result'], row['id']
 
 
+def add_human_actions(found, directory, since, now):
+    path = Path(directory) / 'storage-time.jsonl'
+    try:
+        stream = path.open(encoding='utf-8')
+    except FileNotFoundError:
+        return
+    with stream:
+        locking.lock(stream, shared=True)
+        for number, line in enumerate(stream, 1):
+            where = f'{path}:{number}'
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f'{where}: not JSON ({exc})') from None
+            if not isinstance(row, dict):
+                raise ValueError(f'{where}: expected an object')
+            if 'command' not in row:
+                continue
+            host, items = row.get('host'), row.get('items')
+            if row['command'] not in HUMAN_COMMANDS or not isinstance(host, str) or not host or type(items) is not int or items < 0:
+                raise ValueError(f'{where}: expected a host, human command and non-negative item count')
+            if since <= timestamp(row.get('at'), where) <= now:
+                found.setdefault(host, HostMetrics()).human_actions += 1
+
+
 def compute(directory, nas_root, days=DAYS, now=None, current=()):
     now = now or datetime.now(timezone.utc)
     since = now - timedelta(days=days)
@@ -190,8 +192,10 @@ def compute(directory, nas_root, days=DAYS, now=None, current=()):
     held_since = add_actions(found, actions(directory), since)
     add_held(found, held_since, directory, current)
     add_disk(found, directory, since, current)
-    add_restores(found, nas_root)
+    if nas_root is not None:
+        add_restores(found, nas_root)
     add_drills(found, directory)
+    add_human_actions(found, directory, since, now)
     return dict(sorted(found.items()))
 
 
@@ -213,17 +217,19 @@ def gib(value):
 
 def render(found, days=DAYS, now=None):
     now = now or datetime.now(timezone.utc)
-    lines = [f'Last {days} days, from the reclaim --apply action log and reports. Restores count all INDEX rows with status restored.', '',
+    lines = [f'Last {days} days, from the reclaim --apply action log, reports and storage-time.jsonl. '
+             'Restores count all INDEX rows with status restored.', '',
              '| Host | Reclaimed GiB (acted) | Disk freed GiB (df) | Candidates | Acted | Held for a person | Automation rate '
-             '| Recreated after removal | Restores | Restore drill | Disk used | Oldest held |',
-             '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |']
+             f'| Recreated after removal | Restores | Human actions ({days}d) | Restore drill | Disk used | Oldest held |',
+             '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |']
     for name, entry in found.items():
         rate = 'n/a' if entry.automation is None else f'{entry.automation:.0%}'
         drill = f'{entry.drill[1]} {entry.drill[0]:%Y-%m-%d} ({entry.drill[2]})' if entry.drill else 'none recorded'
         trend = f'{entry.used[0]:.2f}% -> {entry.used[-1]:.2f}%' if entry.used else 'n/a'
         values = (name, gib(entry.acted_bytes), gib(entry.df_freed), len(entry.candidates), len(entry.acted),
-                  len(entry.held - entry.acted), rate, len(entry.recreated), entry.restored, drill, trend, oldest(entry, now))
+                  len(entry.held - entry.acted), rate, len(entry.recreated), entry.restored, entry.human_actions,
+                  drill, trend, oldest(entry, now))
         lines.append('| ' + ' | '.join(map(report.cell, values)) + ' |')
     if not found:
-        lines.append('| (no data) | | | | | | | | | | | |')
+        lines.append('| (no data) | | | | | | | | | | | | |')
     return lines

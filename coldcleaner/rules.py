@@ -5,7 +5,7 @@ import math
 import os
 import re
 import tomllib
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from . import hosts
 
@@ -23,22 +23,25 @@ DEFAULT_PATH = default_path()
 
 
 TOP_LEVEL_KEYS = frozenset({
-    'alert_pct', 'worktree_idle_days', 'archive_idle_days',
+    'alert_pct', 'worktree_idle_days', 'archive_idle_days', 'abandoned_idle_days',
     'nas_root', 'local_archive_mount', 'report_dir', 'live', 'approval',
-    'already_compressed_extensions', 'hosts', 'reclaim_hosts', 'actions_log_mb', 'manual_notes',
+    'already_compressed_extensions', 'hosts', 'reclaim_hosts', 'collect_hosts', 'actions_log_mb', 'manual_notes',
     'max_items_per_run', 'max_gib_per_run', 'attention_note', 'memory_store',
+    'archive_before_delete', 'backup_copy_check', 'notes_vault', 'wait_period_days',
 })
 REQUIRED_KEYS = (
     'alert_pct', 'worktree_idle_days', 'archive_idle_days', 'live', 'nas_root', 'report_dir',
     'already_compressed_extensions', 'hosts',
 )
+LOCAL_POLICY_KEYS = {'report_dir', 'archive_before_delete', 'live'}
 HOST_KEYS = frozenset({'roots', 'archive', 'shared_roots', 'protected', 'exclude', 'kind', 'ssh', 'distro',
-                       'max_items_per_run', 'max_gib_per_run'})
-ARCHIVE_ENTRY_KEYS = ('path', 'days', 'backup', 'exclude', 'category', 'approval', 'preservation')
+                       'max_items_per_run', 'max_gib_per_run'} | LOCAL_POLICY_KEYS)
+ARCHIVE_ENTRY_KEYS = ('path', 'days', 'backup', 'exclude', 'category', 'approval', 'preservation', 'age_days')
 APPROVAL_TIERS = ('worktree', 'clone', 'archive')
 BACKUPS = ('nas', 'none-if-regenerable')
 CATEGORIES = ('scratch', 'test-output', 'artifact')
 PRESERVATION = ('sha256', 'summary')
+ABANDONED_IDLE_DAYS = 30
 LIMIT_KEYS = {'max_items_per_run': 200, 'max_gib_per_run': 100}
 PERSONAL_FOLDERS = ('Documents', 'Desktop', 'Pictures', 'Library', 'iCloud Drive', 'iCloudDrive', 'Google Drive', 'OneDrive*')
 POSIX_PROTECTED = ('/etc', '/usr', '/System', '/mnt/shared-memory', *('~/' + name for name in PERSONAL_FOLDERS))
@@ -57,7 +60,7 @@ def is_windows_temp(path):
     return any(normal == folder or normal.startswith(folder + '\\') for folder in WINDOWS_TEMP_FOLDERS)
 
 
-def load(path=DEFAULT_PATH):
+def load(path=DEFAULT_PATH, local=None, report_dir=None):
     raw = Path(path).read_bytes()
     data = tomllib.loads(raw.decode())
     reject_cache_options(data)
@@ -68,12 +71,37 @@ def load(path=DEFAULT_PATH):
     missing = [key for key in REQUIRED_KEYS if key not in data]
     if missing:
         raise ValueError(f'missing required key {missing[0]}')
+    host_rules = data['hosts']
+    if not isinstance(host_rules, dict):
+        raise ValueError(f'hosts must be a table, got {host_rules!r}')
+    local_policy = {}
+    for name, config in host_rules.items():
+        if not isinstance(config, dict):
+            raise ValueError(f'{name} must be a table, got {config!r}')
+        keys = LOCAL_POLICY_KEYS & config.keys()
+        if not keys:
+            continue
+        if (keys != LOCAL_POLICY_KEYS or config.get('kind') != 'posix'
+                or config['archive_before_delete'] != 'off' or not git_only(config['live'])):
+            raise ValueError(f'{name}: local policy needs a POSIX host, report_dir, archive_before_delete = "off" '
+                             'and live tiers limited to worktree and clone')
+        output_path(f'{name}.report_dir', config['report_dir'])
+        if name == local:
+            local_policy = {key: config[key] for key in keys}
     if type(data.get('alert_pct')) is not int or not 0 < data['alert_pct'] <= 100:
         raise ValueError(f"alert_pct must be an integer from 1 through 100, got {data.get('alert_pct')!r}")
-    for key in ('worktree_idle_days', 'archive_idle_days'):
+    data.setdefault('abandoned_idle_days', ABANDONED_IDLE_DAYS)
+    for key in ('worktree_idle_days', 'archive_idle_days', 'abandoned_idle_days'):
         value = data.get(key)
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
             raise ValueError(f'{key} must be a non-negative finite number, got {value!r}')
+    for key in ('archive_before_delete', 'backup_copy_check', 'notes_vault'):
+        if key in data and data[key] not in ('on', 'off'):
+            raise ValueError(f'{key} must be on or off')
+    if 'wait_period_days' in data:
+        value = data['wait_period_days']
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            raise ValueError('wait_period_days must be a non-negative finite number')
     if 'actions_log_mb' in data and (type(data['actions_log_mb']) is not int or data['actions_log_mb'] < 1):
         raise ValueError(f"actions_log_mb must be a positive integer, got {data['actions_log_mb']!r}")
     for key in LIMIT_KEYS:
@@ -95,25 +123,20 @@ def load(path=DEFAULT_PATH):
             raise ValueError(f'approval[{index}]: unknown tier: {tier!r}; known tiers: {", ".join(APPROVAL_TIERS)}')
         if tier in approval[:index]:
             raise ValueError(f'approval[{index}]: repeated tier: {tier!r}')
-    output_keys = ['nas_root', 'report_dir'] + [key for key in ('attention_note', 'memory_store') if key in data]
+    if local_policy:
+        data.update(local_policy)
+        for key in ('nas_root', 'local_archive_mount', 'attention_note', 'memory_store'):
+            data.pop(key, None)
+    if report_dir is not None:
+        data['report_dir'] = str(report_dir)
+    output_keys = [key for key in ('nas_root', 'report_dir', 'attention_note', 'memory_store') if key in data]
     output_paths = {key: data.get(key) for key in output_keys}
     for key in output_keys:
-        if isinstance(data.get(key), str):
-            data[key] = str(Path(data[key]).expanduser())
-        if not isinstance(data.get(key), str) or not Path(data[key]).is_absolute():
-            raise ValueError(f'{key} must be absolute, got {data.get(key)!r}')
-        if any(c in data[key] for c in '*?['):
-            raise ValueError(f'{key} must not contain glob characters, got {output_paths[key]!r}')
-        if has_control(data[key]):
-            raise ValueError(f'{key} must not contain control characters, got {output_paths[key]!r}')
-        if data[key] != data[key].strip():
-            raise ValueError(f'{key} must not start or end with whitespace, got {output_paths[key]!r}')
-        if '..' in data[key].replace('\\', '/').split('/'):
-            raise ValueError(f"{key} must not contain '..' segments, got {output_paths[key]!r}")
-        if root_or_home(data[key]):
-            raise ValueError(f'{key} must not be a filesystem root or the home folder, got {output_paths[key]!r}')
+        data[key] = output_path(key, output_paths[key])
     mount = data.get('local_archive_mount', '')
     if mount != '':
+        if os.name == 'nt':
+            raise ValueError('local_archive_mount needs a POSIX controller')
         if not isinstance(mount, str) or not Path(mount).is_absolute() or any(c in mount for c in '*?[') or has_control(mount) \
                 or '..' in mount.replace('\\', '/').split('/') or root_or_home(mount):
             raise ValueError(f'local_archive_mount must be an absolute mount point, not a root, home or glob path, got {mount!r}')
@@ -138,13 +161,9 @@ def load(path=DEFAULT_PATH):
         if extension.lower() in seen_extensions:
             raise ValueError(f'already_compressed_extensions[{index}]: repeated extension: {extension!r}')
         seen_extensions.add(extension.lower())
-    host_rules = data.get('hosts')
-    if not isinstance(host_rules, dict):
-        raise ValueError(f'hosts must be a table, got {host_rules!r}')
     registry = {}
+    local_kind = 'powershell' if os.name == 'nt' else 'posix'
     for name, config in host_rules.items():
-        if not isinstance(config, dict):
-            raise ValueError(f'{name} must be a table, got {config!r}')
         unknown = set(config) - HOST_KEYS
         if unknown:
             raise ValueError(f'unknown host option: {name}.{sorted(unknown)[0]}; known options: {", ".join(sorted(HOST_KEYS))}')
@@ -157,15 +176,17 @@ def load(path=DEFAULT_PATH):
         kind = config['kind']
         if kind not in ('posix', 'powershell', 'wsl'):
             raise ValueError(f'{name}.kind must be posix, powershell or wsl, got {kind!r}')
-        if kind != 'posix' and 'ssh' not in config:
+        if kind not in ('posix', local_kind) and 'ssh' not in config:
             raise ValueError(f'{name}.ssh is required for {kind} hosts: the controller runs on Linux or macOS')
+        if os.name == 'nt' and kind == 'posix' and 'ssh' not in config:
+            raise ValueError(f'{name}.ssh is required for posix hosts on a Windows controller')
         for key in ('ssh', 'distro'):
             if key in config and (not isinstance(config[key], str) or not config[key].strip()):
                 raise ValueError(f'{name}.{key} must be a nonempty string, got {config[key]!r}')
         for key in LIMIT_KEYS:
             if key in config:
                 positive_limit(f'{name}.{key}', config[key])
-        registry[name] = hosts.Host(name, kind, config.get('ssh'), config.get('distro'))
+        registry[name] = hosts.Host(name, kind, None if name == local else config.get('ssh'), config.get('distro'))
         for key in ('roots', 'archive', 'shared_roots', 'protected', 'exclude'):
             paths = config.get(key, [])
             if not isinstance(paths, list):
@@ -174,6 +195,8 @@ def load(path=DEFAULT_PATH):
                 for index, entry in enumerate(paths):
                     if isinstance(entry, dict):
                         check_archive_entry(f'{name}.archive[{index}]', entry)
+                        if 'age_days' in entry and kind != 'posix':
+                            raise ValueError(f'{name}.archive[{index}].age_days needs a posix host')
                 paths = archive_patterns(config)
             for index, path in enumerate(paths):
                 if not valid_path(path):
@@ -187,21 +210,38 @@ def load(path=DEFAULT_PATH):
                 location = protected_location(path, kind, config.get('protected', []))
                 if location:
                     raise ValueError(f'{name}.{key}[{index}]: overlaps protected location {location!r}, got {path!r}')
+    if local is not None and (local not in registry or registry[local].kind != local_kind):
+        raise ValueError(f'--local needs a configured {local_kind} host, got {local!r}; known hosts: {", ".join(sorted(registry))}')
+    if local_kind == 'powershell':
+        local_names = [name for name, host in registry.items() if host.ssh is None]
+        if len(local_names) > 1:
+            raise ValueError(f'a Windows controller can run only one local PowerShell host, got {", ".join(local_names)}')
     reclaim_hosts = data.get('reclaim_hosts', [name for name, host in registry.items() if host.kind != 'wsl'])
     if not isinstance(reclaim_hosts, list):
         raise ValueError(f'reclaim_hosts must be an array, got {reclaim_hosts!r}')
     for index, name in enumerate(reclaim_hosts):
         if not isinstance(name, str) or name not in registry:
             raise ValueError(f'reclaim_hosts[{index}]: unknown host: {name!r}; known hosts: {", ".join(sorted(registry))}')
-    data['reclaim_hosts'] = reclaim_hosts
-    for name, local in host_rules.items():
+    collect_hosts = data.get('collect_hosts', [])
+    if not isinstance(collect_hosts, list):
+        raise ValueError('collect_hosts must be an array of host names')
+    for index, name in enumerate(collect_hosts):
+        if (not isinstance(name, str) or name not in registry or not host_rules[name].get('ssh')
+                or registry[name].kind != 'posix' or 'report_dir' not in host_rules[name]):
+            raise ValueError(f'collect_hosts[{index}]: expected a remote POSIX host with a local report_dir, got {name!r}')
+        if name in collect_hosts[:index]:
+            raise ValueError(f'collect_hosts[{index}]: repeated host {name!r}')
+    data['reclaim_hosts'] = [name for name in reclaim_hosts if name not in collect_hosts]
+    data['collect_hosts'] = [] if local_policy else collect_hosts
+    for name, config in host_rules.items():
         if registry[name].ssh is not None:
             continue
         for tier in ('roots', 'archive'):
-            for index, path in enumerate(archive_patterns(local) if tier == 'archive' else local.get(tier, [])):
-                cleanup = PurePosixPath(Path(path).expanduser()).parts
+            for index, path in enumerate(archive_patterns(config) if tier == 'archive' else config.get(tier, [])):
+                windows = registry[name].kind == 'powershell'
+                cleanup = output_parts(path, windows)
                 for key in output_keys:
-                    output = PurePosixPath(data[key]).parts
+                    output = output_parts(data[key], windows)
                     if (len(cleanup) <= len(output) or key == 'memory_store') and all(
                             fnmatch.fnmatchcase(part, pattern)
                             and (not part.startswith('.') or pattern.startswith('.'))
@@ -209,8 +249,39 @@ def load(path=DEFAULT_PATH):
                         raise ValueError(f'{name}.{tier}[{index}]: would clean up {key} {output_paths[key]!r}, got {path!r}')
     hosts.HOSTS.clear()
     hosts.HOSTS.update(registry)
-    data['rules_sha256'] = hashlib.sha256(raw).hexdigest()
+    policy = raw + b'\0' + local.encode() if local_policy else raw
+    data['rules_sha256'] = hashlib.sha256(policy).hexdigest()
     return data
+
+
+def git_only(live):
+    return (isinstance(live, list) and 1 <= len(live) <= 2
+            and all(tier in ('worktree', 'clone') for tier in live) and len(set(live)) == len(live))
+
+
+def output_path(key, value):
+    expanded = str(Path(value).expanduser()) if isinstance(value, str) else value
+    if not isinstance(expanded, str) or not Path(expanded).is_absolute():
+        raise ValueError(f'{key} must be absolute, got {expanded!r}')
+    if any(c in expanded for c in '*?['):
+        raise ValueError(f'{key} must not contain glob characters, got {value!r}')
+    if has_control(expanded):
+        raise ValueError(f'{key} must not contain control characters, got {value!r}')
+    if expanded != expanded.strip():
+        raise ValueError(f'{key} must not start or end with whitespace, got {value!r}')
+    if '..' in expanded.replace('\\', '/').split('/'):
+        raise ValueError(f"{key} must not contain '..' segments, got {value!r}")
+    path = Path(expanded)
+    if root_or_home(expanded) or (os.name == 'nt' and path in (Path.home(), Path(path.anchor))):
+        raise ValueError(f'{key} must not be a filesystem root or the home folder, got {value!r}')
+    return expanded
+
+
+def output_parts(path, windows):
+    if windows:
+        expanded = PureWindowsPath(os.path.expandvars(os.path.expanduser(path)))
+        return tuple(part.casefold() for part in expanded.parts)
+    return PurePosixPath(Path(path).expanduser()).parts
 
 
 def archive_patterns(host_rules):
@@ -220,7 +291,7 @@ def archive_patterns(host_rules):
 def archive_entry(host_rules, pattern):
     entry = next((entry for entry in host_rules.get('archive', [])
                   if isinstance(entry, dict) and entry['path'] == pattern), {})
-    return dict(days=entry.get('days'), backup=entry.get('backup', 'nas'),
+    return dict(days=entry.get('age_days', entry.get('days')), backup=entry.get('backup', 'nas'),
                 exclude=[*host_rules.get('exclude', []), *entry.get('exclude', [])], category=entry.get('category'),
                 approval=entry.get('approval', False),
                 preservation=entry.get('preservation', PRESERVATION[0]) if entry.get('category') == 'artifact' else None)
@@ -235,6 +306,11 @@ def check_archive_entry(where, entry):
     days = entry.get('days', 0)
     if type(days) not in (int, float) or not math.isfinite(days) or days < 0:
         raise ValueError(f'{where}.days must be a non-negative finite number, got {days!r}')
+    if 'age_days' in entry:
+        if type(entry['age_days']) is not int or entry['age_days'] not in (30, 60, 90):
+            raise ValueError(f'{where}.age_days must be 30, 60 or 90')
+        if 'days' in entry:
+            raise ValueError(f'{where}: use age_days or days, not both')
     backup = entry.get('backup', 'nas')
     if backup not in BACKUPS:
         raise ValueError(f'{where}.backup must be one of {", ".join(BACKUPS)}, got {backup!r}')

@@ -34,8 +34,13 @@
         "tests",
         "-v"
       ]
+    },
+    {
+      "role": "lint",
+      "argv": ["shellcheck", ".fleet/verify.sh"]
     }
   ],
+  "verify_tools": ["shellcheck"],
   "approvals": [
     {
       "scope": "tree",

@@ -66,7 +66,7 @@ class RulesTests(CoreCase):
     def test_invalid_rules_rejected(self):
         original = (Path(__file__).parent / 'fixtures/rules.toml').read_text()
         for old, new in [('alert_pct = 80', 'alert_pct = true'), ('alert_pct = 80', 'alert_pct = 0'),
-                         ('live = ["worktree", "archive"]', 'live = ["oops"]'),
+                         ('live = [', 'live = ["oops", '),
                          ('archive_idle_days = 4', 'archive_idle_days = -1')]:
             with self.subTest(new=new):
                 path = self.root / 'rules.toml'

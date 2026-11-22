@@ -1,6 +1,6 @@
 # coldcleaner
 
-Coldcleaner frees disk space that coding work leaves behind. It removes finished Git worktrees once their commits are on GitHub, and it archives the scratch, evidence and temp folders you list, checks every archived file, and only then deletes the original. It runs from one machine and can clean that machine or others over SSH (Linux, macOS and Windows).
+Coldcleaner removes finished Git worktrees published on GitHub and archives listed scratch, evidence and temp folders, verifying copies before deletion. It cleans locally or over SSH (Linux, macOS and Windows).
 
 > **What it never touches**
 >
@@ -40,24 +40,26 @@ coldcleaner doctor
 coldcleaner reclaim --host local
 ```
 
-1. `uv tool install` installs the v0.3.2 release and adds a `coldcleaner` command to `~/.local/bin`. From a clone, `uv tool install .` installs that copy.
-2. The next two lines download the example rules file to `~/.config/coldcleaner/rules.toml` (or `$XDG_CONFIG_HOME/coldcleaner/rules.toml` if you set `XDG_CONFIG_HOME`), which is where coldcleaner looks. An existing file is kept.
-3. `doctor` checks what cleanup needs and prints one PASS or FAIL line for each item. It changes nothing. It exits 1 while anything fails; that is expected on a new machine, and the dry run below still works.
-4. `reclaim --host local` is a dry run. It changes nothing, writes a report and prints the report's path, then one line per host with its disk use and how much it would free. The report lists each proposed action with its reason, and sums skips by reason.
+1. `uv tool install` adds the v0.3.2 command to `~/.local/bin`. To install from a clone, run `uv tool install .`.
+2. Download the example to `~/.config/coldcleaner/rules.toml` or `$XDG_CONFIG_HOME/coldcleaner/rules.toml`. An existing file is kept.
+3. `doctor` reports PASS or FAIL for each prerequisite. Exit 1 means a check failed. You can still dry-run.
+4. `reclaim --host local` writes a dry-run report with proposed actions and skip reasons. It prints the report path, disk use and estimated savings.
 
-The example rules list no folders, so the first report has nothing to do. That is the point: you add folders next.
+The example rules list no folders. Add your own below.
 
 ## Turn cleanup on
+
+`coldcleaner init` asks six policy questions and backs up edited rules. Blank answers retain settings; `coldcleaner init --yes` keeps current settings without prompting. It selects no new paths.
 
 Open the rules file you just copied (`~/.config/coldcleaner/rules.toml`, or under `$XDG_CONFIG_HOME`) and work through these steps in order:
 
 1. Under `[hosts.local]`, set `roots` to the folders that hold your Git repositories, for example `roots = ["~/projects"]`. Coldcleaner finds worktrees inside them.
 2. Set `archive` to the scratch or temp folders you want archived and removed once they are idle, for example `archive = ["~/projects/*/.scratch"]`.
 3. Set `nas_root` to the folder where archives go. The name comes from NAS (network-attached storage): the folder must be on a network share (NFS or SMB), or on a second drive that you name in `local_archive_mount`. See [Archive storage](docs/reference.md#archive-storage).
-4. Run `coldcleaner check-rules`, then `coldcleaner reclaim --host local` again, and read the new report.
-5. When the report shows only what you expect, turn on one kind of cleanup, for example `live = ["archive"]`, and run `coldcleaner reclaim --host local --apply`.
+4. Set a live tier, for example `live = ["archive"]`. Run `coldcleaner check-rules` and `coldcleaner reclaim --host local`. Review the dry-run report.
+5. Run `coldcleaner reclaim --host local --apply` if the report looks right. Confirm `Mode: apply` before scheduling cleanup.
 
-`--apply` refuses to run and exits 2 unless `live` lists `worktree` or `archive`, and until a current-rules dry run covers each host. Worktree cleanup (`live = ["worktree"]`) also needs `gh` logged in, because it asks GitHub whether each branch was merged.
+`--apply` requires a live tier and a current-rules dry run per host. Worktree cleanup uses `gh` to verify published commits and pull requests.
 
 There are two kinds of cleanup:
 
@@ -72,7 +74,11 @@ Get anything back with `coldcleaner find TERM` (search archives by path) and `co
 
 Once a live run looks right, schedule `coldcleaner reclaim --apply` daily with a systemd user timer on Linux or cron on macOS. Copy-paste setups for both are in [docs/reference.md](docs/reference.md#run-it-every-night).
 
-Exit codes: 0 means the run worked; 1 means a host was unreachable or a step failed; 2 means it refused to run (bad rules or arguments); 3 means the run worked but a disk is still at or above `alert_pct` (80% in the example), or a host reached its per-run deletion limit (`max_items_per_run`, `max_gib_per_run`).
+After a rules change, the nightly records a dry run for each uncovered host. The next nightly can apply automatically using that report.
+
+In text mode, exit code 0 means the run completed, including when `--apply` recorded a dry run. Exit code 1 means a step failed or an SSH outage left the scan without a completed host. Exit code 2 means the command refused to run, for example because of bad rules or arguments. Exit code 3 means a host needs attention for an isolated SSH outage, missing apply coverage, disk use at or above `alert_pct` (80% in the example), or at least 1 GiB skipped due to the per-run deletion limit.
+
+Scripts using `reclaim --json` get exit code 0 for success, 1 for attention or refusal, and 2 for an incomplete run. See the [JSON schema](docs/reference.md#calling-it-from-another-tool).
 
 ## Host-local policy
 
@@ -131,4 +137,6 @@ Install Python 3.14, Git, tar and zstd, then run the offline tests from the repo
 python3 -m unittest discover -s tests -v
 ```
 
-The tests use temporary folders, local Git remotes and fake hosts. They never contact real machines, archive storage or GitHub. See `CONTRIBUTING.md` before opening a pull request, and `SECURITY.md` to report a security problem. Coldcleaner is licensed under the MIT License; see `LICENSE`.
+Tests use temporary folders, local Git remotes and fake hosts, without network access. See `CONTRIBUTING.md`, `SECURITY.md` and the MIT `LICENSE`.
+
+Preservation defaults stay enabled. See [cleanup policy options](docs/reference.md#cleanup-policy-options) to disable archiving, copy verification, vault receipts or the wait period.

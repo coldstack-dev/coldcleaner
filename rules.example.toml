@@ -1,5 +1,10 @@
+archive_before_delete = "on"
+backup_copy_check = "on"
+notes_vault = "on"
+wait_period_days = 7 # Omit to keep tier and per-entry idle windows, including the temp-folder minimum.
 alert_pct = 80
 worktree_idle_days = 7
+abandoned_idle_days = 30
 archive_idle_days = 4
 nas_root = "~/.local/share/coldcleaner/archive" # Archiving refuses until this is on a NAS or under local_archive_mount.
 local_archive_mount = ""
@@ -7,6 +12,7 @@ report_dir = "~/.local/state/coldcleaner/reports"
 attention_note = "~/.local/state/coldcleaner/attention.md"
 memory_store = "~/.local/state/coldvault/preservation" # Receipts that make artifact entries eligible; never cleaned.
 actions_log_mb = 10
+collect_hosts = []
 max_items_per_run = 200 # Per host; a host table may override it.
 max_gib_per_run = 100 # Per host; a host table may override it.
 live = []
@@ -38,3 +44,9 @@ exclude = [] # Paths or globs never archived; an archive match equal to, inside 
 # kind = "powershell"
 # ssh = "windows.example.invalid"
 # roots = ['%USERPROFILE%\REPOS']
+
+# On a POSIX host, use an archive table such as
+# archive = [{ path = "~/projects/*/.scratch", age_days = 60 }]
+# to archive and remove individual children idle for 30, 60 or 90 days.
+# Omit age_days to keep normal whole-path archive behavior. Do not combine it with days.
+# The host-local archive allowlist must also match the child paths, including hidden ones.

@@ -1,4 +1,5 @@
 import os
+import importlib
 import shutil
 import subprocess
 import sys
@@ -28,8 +29,15 @@ def tool(name):
     return (True, path) if path else (False, f'{name} not found on PATH')
 
 
+def zstd():
+    if os.name == 'nt':
+        importlib.import_module('compression.zstd')
+        return True, 'Python compression.zstd'
+    return tool('zstd')
+
+
 def gh_auth():
-    result = hosts.run(hosts.LOCAL, 'gh auth status', check=False, timeout=60)
+    result = hosts.controller(['gh', 'auth', 'status'], check=False, timeout=60)
     if result.returncode == 0:
         return True, 'gh auth status OK'
     lines = (result.stderr + result.stdout).decode(errors='replace').strip().splitlines()
@@ -66,10 +74,12 @@ def outcome(check, *args):
 
 def checks(config, chosen_hosts):
     yield 'python', outcome(python)
-    yield 'zstd', outcome(tool, 'zstd')
+    if 'nas_root' in config:
+        yield 'zstd', outcome(zstd)
     yield 'git', outcome(tool, 'git')
     yield 'gh auth', outcome(gh_auth)
-    yield 'nas_root', outcome(writable, config['nas_root'])
+    if 'nas_root' in config:
+        yield 'nas_root', outcome(writable, config['nas_root'])
     yield 'report_dir', outcome(writable, config['report_dir'])
     for host in chosen_hosts:
         reachable = outcome(reach, host)

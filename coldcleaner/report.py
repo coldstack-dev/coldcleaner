@@ -1,4 +1,3 @@
-import fcntl
 import itertools
 import json
 import os
@@ -9,22 +8,20 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import locking
 from .disk import Usage
+from .report_files import RECLAIM, action_line, cell, paths
 
 SKIP_ROWS = 20
 NOTE_PATHS = 5
 PREVIEWED = 'Reclaim dry run complete for: '
-RECLAIM = 'Command: reclaim'
+MANAGED = 'Managed agent-artifact bytes: '
 HELD = {
     'UNIQUE: unpushed commits or incomplete origin proof': 'push it, or point origin at the repo that has it',
     'IN USE: uncommitted work or stashes': 'commit or discard it',
     'IN USE: work is neither merged nor closed at this head': 'open, merge or close a PR',
     'IN USE: open pull request': 'merge or close the PR',
 }
-
-
-def cell(value):
-    return str(value).replace('|', '\\|').replace('\n', ' ').replace('\r', ' ')
 
 
 def size(value):
@@ -47,6 +44,8 @@ class HostReport:
     attention: str = ''
     unlisted: list = field(default_factory=list)
     unlisted_complete: bool = True
+    grew: list = field(default_factory=list)
+    unreachable: bool = False
 
     @property
     def would_free(self):
@@ -61,10 +60,18 @@ CATEGORIES = {'worktree': 'Completed worktrees', 'clone': 'Redundant clones', 's
               'test-output': 'Test and benchmark outputs', 'artifact': 'Archived agent artifacts'}
 
 
+def category(row):
+    tier = row['tier']
+    if tier in ('worktree', 'clone'):
+        return tier
+    if tier == 'archive':
+        return row.get('category')
+
+
 def categories(reports):
     totals = {key: dict(items=0, reclaimable_bytes=0, acted_bytes=0) for key in CATEGORIES}
     for row in (row for report in reports for row in report.actions):
-        key = row['tier'] if row['tier'] in ('worktree', 'clone') else row.get('category') if row['tier'] == 'archive' else None
+        key = category(row)
         if key in totals and (row['action'].startswith('would ') or acted(row)):
             totals[key]['items'] += 1
             totals[key]['reclaimable_bytes'] += row['bytes']
@@ -85,9 +92,7 @@ def acted(row):
 
 def action_table(lines, rows):
     lines.extend(['', '| Tier | Action | Path | Bytes | Reason |', '| --- | --- | --- | ---: | --- |'])
-    for row in rows:
-        values = [row[key] for key in ('tier', 'action', 'path', 'bytes', 'reason')]
-        lines.append('| ' + ' | '.join(map(cell, values)) + ' |')
+    lines.extend(map(action_line, rows))
 
 
 def note_lines(notes):
@@ -132,20 +137,46 @@ def inside(path, parent):
     return path == parent or path.startswith((parent + '/', parent + '\\'))
 
 
+def outermost(rows, removed=()):
+    covered = {row['path'].rstrip('/\\') for _, row in removed}
+    for index, row in sorted(rows, key=lambda item: (len(item[1]['path']), -item[0])):
+        path = row['path']
+        if path in covered or any(path[:separator.start()] in covered for separator in re.finditer(r'[/\\]', path)):
+            continue
+        covered.add(path.rstrip('/\\'))
+        yield index, row
+
+
+def remaining(rows, removed):
+    for index, row in outermost(rows, removed):
+        freed = sum(gone['bytes'] for later, gone in removed if later > index and inside(gone['path'], row['path']))
+        yield row, max(0, row['bytes'] - freed)
+
+
+def managed_partial(entry):
+    return incomplete(entry) or any('skip sizes' in note or note.startswith('Unreadable, skipped') for note in entry.notes)
+
+
+def managed(report):
+    rows = [(index, row) for index, row in enumerate(report.actions)
+            if row['tier'] in ('worktree', 'clone', 'archive') and row['reason'] != 'package caches are excluded']
+    if not rows and (incomplete(report) or report.after is None or any(row['tier'] == 'execution' for row in report.actions)):
+        return dict(bytes=None, coverage='unavailable')
+    removed = [(index, row) for index, row in rows if acted(row)]
+    pending = ((index, row) for index, row in rows if not acted(row))
+    managed = sum(size for _, size in remaining(pending, removed))
+    return dict(bytes=managed, coverage='partial' if managed_partial(report) else 'complete')
+
+
 def scope(report):
     if report.after is None or 'alert_pct' not in report.attention:
         return []
-    rows = list(enumerate(report.actions))
-    removed = [(index, row) for index, row in rows if acted(row)]
-    outer = []
-    for index, row in sorted(rows, key=lambda item: len(item[1]['path'])):
-        if not acted(row) and not any(inside(row['path'], kept['path']) for _, kept in outer + removed):
-            outer.append((index, row))
-    managed = sum(max(0, row['bytes'] - sum(gone['bytes'] for later, gone in removed if later > index and inside(gone['path'], row['path'])))
-                  for index, row in outer)
-    partial = incomplete(report) or any('skip sizes' in note or note.startswith('Unreadable, skipped') for note in report.notes)
+    sample = managed(report)
+    if sample['bytes'] is None:
+        return []
+    partial = sample['coverage'] == 'partial'
     tail = 'Sizing was incomplete, so part of the rest may also be in scope.' if partial else "The rest is outside Coldcleaner's scope."
-    return [f"- Used {report.after.used / 1024**3:.2f} GiB; {'at least ' if partial else ''}{managed / 1024**3:.2f} GiB of it "
+    return [f"- Used {report.after.used / 1024**3:.2f} GiB; {'at least ' if partial else ''}{sample['bytes'] / 1024**3:.2f} GiB of it "
             f"is in Coldcleaner's managed scope (listed archive paths, worktrees and clones). {tail}"]
 
 
@@ -160,7 +191,15 @@ def unlisted(report):
     lines.extend(['', '| Path | GiB | Hint |', '| --- | ---: | --- |'])
     for row in report.unlisted:
         gib = f"{'' if row['complete'] else 'at least '}{row['bytes'] / 1024**3:.2f}"
+        if row.get('measured'):
+            gib += f" (as of {row['measured'][:10]})"
         lines.append(f"| {cell(row['path'])} | {gib} | {cell(row['hint'])} |")
+    if report.grew:
+        lines.extend(['', '### Grew since the last scan, report only', '',
+                      '| Path | Grew GiB | Now GiB | Last measured |', '| --- | ---: | ---: | --- |'])
+        for row in report.grew:
+            lines.append(f"| {cell(row['path'])} | {(row['bytes'] - row['before']) / 1024**3:.2f} | "
+                         f"{row['bytes'] / 1024**3:.2f} | {row['since']} |")
     return lines
 
 
@@ -184,24 +223,33 @@ def incomplete(entry):
     return bool(entry.errors) or any(row['action'] == 'error' for row in entry.actions)
 
 
-def announce(reports, directory, note, report_path, started):
+def append_attention(note, report_path, parts):
+    now = datetime.now(timezone.utc)
+    Path(note).parent.mkdir(parents=True, exist_ok=True)
+    with Path(note).open('a', encoding='utf-8') as stream:
+        stream.write(f"\n### {now:%Y-%m-%d} · coldcleaner\nATTENTION coldcleaner at {now:%Y-%m-%dT%H:%MZ}: "
+                     f"{'; '.join(parts)}. Report: {report_path}\n")
+
+
+def announce(reports, directory, note, report_path, started, *, preview=False):
     directory = Path(directory)
-    current = {entry.name: {row['path'] for row in entry.actions if held(row)} for entry in reports}
+    parts = [f'{entry.name}: {entry.attention}' for entry in reports if entry.attention]
+    if preview and not parts:
+        return
     with (directory / 'reclaim-actions.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        locking.lock(lock)
+        if preview:
+            append_attention(note, report_path, parts)
+            return
+        current = {entry.name: {row['path'] for row in entry.actions if held(row)} for entry in reports}
         state = directory / 'held.json'
         previous = held_state(state)
         fresh = [entry for entry in reports if entry.name not in previous or previous[entry.name][0] <= started]
         new = sum(len(current[entry.name] - previous.get(entry.name, (started, set()))[1]) for entry in fresh)
-        parts = [f'{entry.name}: {entry.attention}' for entry in reports if entry.attention]
         if new:
             parts.append(f'{new} new held worktrees ({sum(map(len, current.values()))} held)')
         if parts:
-            now = datetime.now(timezone.utc)
-            Path(note).parent.mkdir(parents=True, exist_ok=True)
-            with Path(note).open('a', encoding='utf-8') as stream:
-                stream.write(f"\n### {now:%Y-%m-%d} · coldcleaner\nATTENTION coldcleaner at {now:%Y-%m-%dT%H:%MZ}: "
-                             f"{'; '.join(parts)}. Report: {report_path}\n")
+            append_attention(note, report_path, parts)
         for entry in fresh:
             kept = previous.get(entry.name, (started, set()))[1] if incomplete(entry) else set()
             previous[entry.name] = started, current[entry.name] | kept
@@ -215,7 +263,7 @@ def render(reports, apply=False, code=None, manual_notes=(), rules_sha256=None, 
     now = datetime.now(timezone.utc)
     lines = [f'# coldcleaner {now:%Y-%m-%d %H:%M:%S} UTC', '',
              f'Mode: {"apply, limited to live tiers" if apply else "dry run"}. Byte estimates are logical file sizes, not guaranteed free space.', '']
-    previewed = [entry.name for entry in reports if not entry.errors and all(row['action'] != 'error' for row in entry.actions)]
+    previewed = [entry.name for entry in reports if not incomplete(entry)]
     if reclaim and not apply and previewed:
         lines[2:2] = [f"{PREVIEWED}{', '.join(previewed)}", '']
     if reclaim:
@@ -234,7 +282,12 @@ def render(reports, apply=False, code=None, manual_notes=(), rules_sha256=None, 
             lines.extend([f'Acted on: {size(report.acted_bytes)}', ''])
         if report.attention:
             lines.append(f'- ATTENTION: {cell(report.attention)}')
-        lines.extend(scope(report))
+        if reclaim:
+            sample = managed(report)
+            observed = 'unavailable' if sample['bytes'] is None else f"{size(sample['bytes'])}; coverage {sample['coverage']}"
+            lines.extend([MANAGED + observed, ''])
+        else:
+            lines.extend(scope(report))
         lines.extend(f'- {cell(error)}' for error in report.errors)
         lines.extend(note_lines(report.notes))
         if report.broad_references:
@@ -267,12 +320,6 @@ def write(reports, directory, apply=False, code=None, manual_notes=(), rules_sha
     finally:
         temporary.unlink(missing_ok=True)
     return path
-
-
-def paths(directory):
-    return sorted((path for path in Path(directory).glob('????-??-??*.md')
-                   if re.fullmatch(r'\d{4}-\d{2}-\d{2}(?:-\d{6}-\d{6}-[0-9a-f]{32})?\.md', path.name)),
-                  key=lambda path: path.stem)
 
 
 def dry_run_hosts(path, rules_sha256=None):

@@ -9,7 +9,8 @@ def usable(base):
     base = Path(base)
     if not (base.is_dir() and os.access(base, os.W_OK | os.X_OK)):
         return False
-    return not any((folder / '.git').exists() for start in (base, base.resolve()) for folder in (start, *start.parents))
+    return not any((folder / marker).exists() for start in (base, base.resolve())
+                   for folder in (start, *start.parents) for marker in ('.git', '.cold-artifact.json'))
 
 
 def choose(current, fallbacks=FALLBACKS):

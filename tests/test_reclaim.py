@@ -3608,11 +3608,11 @@ class ReclaimTests(unittest.TestCase):
             (home / name / 'x').mkdir(parents=True)
         with patch.dict(os.environ, HOME=str(home)), patch.object(reclaim_probe, 'threads', return_value=[]), \
                 patch.object(reclaim_probe, 'references', return_value=[]):
-            for path in ('/etc/ssh', '/usr/share', '/System/Library', '/mnt/shared-memory/Agent-Space', '/mnt',
+            for path in ('/etc/ssh', '/usr/share', '/System/Library', '/mnt/example-vault/notes', '/mnt',
                          *(str(home / name / 'x') for name in ('Documents', 'Desktop', 'Pictures', 'Library/Caches',
                                                                 'iCloud Drive', 'Google Drive', 'OneDrive - Work'))):
                 with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'protected location'):
-                    reclaim_probe.guard(path)
+                    reclaim_probe.guard(path, protected=['/mnt/example-vault'])
             (home / 'projects' / 'scratch').mkdir(parents=True)
             reclaim_probe.guard(home / 'projects' / 'scratch')
 

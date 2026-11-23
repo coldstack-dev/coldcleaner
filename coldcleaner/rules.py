@@ -45,7 +45,7 @@ PRESERVATION = ('sha256', 'summary')
 ABANDONED_IDLE_DAYS = 30
 LIMIT_KEYS = {'max_items_per_run': 200, 'max_gib_per_run': 100}
 PERSONAL_FOLDERS = ('Documents', 'Desktop', 'Pictures', 'Library', 'iCloud Drive', 'iCloudDrive', 'Google Drive', 'OneDrive*')
-POSIX_PROTECTED = ('/etc', '/usr', '/System', '/mnt/shared-memory', *('~/' + name for name in PERSONAL_FOLDERS))
+POSIX_PROTECTED = ('/etc', '/usr', '/System', *('~/' + name for name in PERSONAL_FOLDERS))
 WINDOWS_SYSTEM = ('C:\\Windows', '%SYSTEMROOT%', '%WINDIR%')
 WINDOWS_PROTECTED = ('C:\\Program Files*', '%PROGRAMFILES%', '%PROGRAMFILES(X86)%', '%PROGRAMW6432%',
                      '%ONEDRIVE%', '%ONEDRIVECONSUMER%', '%ONEDRIVECOMMERCIAL%',

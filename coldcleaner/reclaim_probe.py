@@ -1077,7 +1077,7 @@ def protected_location(path, extra=()):
         if anchor and anchor[0].casefold().startswith('program files'):
             return anchor[0]
     else:
-        locations += ['/etc', '/usr', '/System', '/mnt/shared-memory']
+        locations += ['/etc', '/usr', '/System']
     for location in locations:
         if overlap(path, location):
             return location

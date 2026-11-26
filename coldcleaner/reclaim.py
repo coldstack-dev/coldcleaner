@@ -130,19 +130,30 @@ def display_remote(url):
     return clean
 
 
+class GitHubUnavailable(RuntimeError):
+    pass
+
+
 def github_pr_query(args, repo=None):
     for delay in (*PR_RETRY_DELAYS, None):
         try:
-            result = hosts.controller(args, timeout=30)
+            try:
+                result = hosts.controller(args, timeout=30)
+            except FileNotFoundError:
+                raise GitHubUnavailable('gh not found') from None
             response = json.loads(result.stdout)
             if not isinstance(response, dict) or response.get('errors') or not isinstance(response.get('data'), dict):
                 raise RuntimeError('GitHub PR inventory incomplete')
             return response['data']
         except subprocess.CalledProcessError as exc:
+            if exc.returncode == 127:
+                raise GitHubUnavailable('gh not found') from None
             if repo and missing_repository(exc.stdout):
                 raise ValueError('UNIQUE: GitHub repository not found: ' + repo) from None
             if delay is None:
                 raise
+        except GitHubUnavailable:
+            raise
         except (RuntimeError, OSError, subprocess.TimeoutExpired, ValueError) as exc:
             if delay is None:
                 raise RuntimeError('GitHub PR inventory incomplete: ' + str(exc)) from exc
@@ -168,7 +179,6 @@ def deduplicate_prs(rows):
 
 
 def pull_requests(repo, branch, head=None, head_repository=None):
-    head_repository = head_repository or repo
     owner, name = repo.split('/')
     selections = {
         'branch': 'pullRequests(headRefName:$branch,first:100,after:$branchCursor){' + PR_FIELDS + '}',
@@ -180,7 +190,7 @@ def pull_requests(repo, branch, head=None, head_repository=None):
     while pending:
         variables = ''.join(f',${key}:String!,${key}Cursor:String' for key in pending)
         query = ('query($owner:String!,$name:String!' + variables + '){repository(owner:$owner,name:$name){'
-                 'parent{nameWithOwner} ' + ' '.join(selections[key] for key in pending) + '}}')
+                 'nameWithOwner parent{nameWithOwner} ' + ' '.join(selections[key] for key in pending) + '}}')
         args = ['gh', 'api', 'graphql', '-f', 'query=' + query, '-f', 'owner=' + owner,
                 '-f', 'name=' + name]
         for key, cursor in pending.items():
@@ -188,6 +198,7 @@ def pull_requests(repo, branch, head=None, head_repository=None):
             if cursor:
                 args += ['-f', f'{key}Cursor={cursor}']
         root = github_pr_query(args, repo)['repository']
+        head_repository = head_repository or root.get('nameWithOwner') or repo
         parent = (root['parent'] or {}).get('nameWithOwner')
         following = {}
         for key in pending:
@@ -212,7 +223,7 @@ def pull_requests_batch(keys):
     selections = []
     for index, (repo, branch, head) in enumerate(keys):
         owner, name = map(json.dumps, repo.split('/'))
-        fields = ['parent{nameWithOwner}']
+        fields = ['nameWithOwner', 'parent{nameWithOwner}']
         if branch:
             fields.append(f'pullRequests(headRefName:{json.dumps(branch)},first:10){{{PR_FIELDS}}}')
         if head:
@@ -229,7 +240,7 @@ def pull_requests_batch(keys):
         if head and root['object'] is not None:
             pages.append(root['object']['associatedPullRequests'])
         if all(page['pageInfo']['hasNextPage'] is False for page in pages):
-            rows = [row for page in pages for row in pr_rows(page, repo)]
+            rows = [row for page in pages for row in pr_rows(page, root.get('nameWithOwner') or repo)]
             complete[key] = deduplicate_prs(rows) if branch and head else rows
     return complete
 
@@ -243,8 +254,7 @@ def missing_repository(stdout):
 
 
 def published_main(listing):
-    refs = dict(reversed(line.split()) for line in listing.splitlines() if len(line.split()) == 2)
-    return refs.get('refs/heads/main') or refs.get('refs/heads/master')
+    return reclaim_probe.default_branch(dict(reversed(line.split()) for line in listing.splitlines() if len(line.split()) == 2))
 
 
 def merged_on_github(repo, head, main):
@@ -252,7 +262,7 @@ def merged_on_github(repo, head, main):
         return False
     try:
         result = hosts.controller(['gh', 'api', f'repos/{repo}/compare/{main}...{head}', '--jq', '.status'])
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return False
     return result.stdout.decode().strip() in ('behind', 'identical')
 
@@ -274,8 +284,8 @@ ABANDONED_HOLDS = ('IN USE: uncommitted work or stashes', 'UNIQUE: unpushed comm
                    'IN USE: work is neither merged nor closed at this head')
 
 
-def abandoned_work(state, prs):
-    return (completion(state, prs) in ABANDONED_HOLDS and not state['shared_stash'] and not state['index_only']
+def abandoned_work(state, prs, agent=False):
+    return (completion(state, prs) in ABANDONED_HOLDS and (agent or not state['shared_stash']) and not state['index_only']
             and not any(row['state'] == 'OPEN' for row in prs))
 
 
@@ -302,7 +312,12 @@ def preserve_git(host, path, directory, state):
     with tempfile.TemporaryFile() as errors:
         process = hosts.python_stream(host, SOURCE, dict(operation='bundle', path=path, reflog=state['reflog']), stderr=errors)
         try:
-            metadata = json.loads(process.stdout.readline())
+            try:
+                metadata = json.loads(process.stdout.readline())
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise ValueError('Git recovery bundle unavailable: missing or invalid metadata') from exc
+            if not isinstance(metadata, dict) or not isinstance(metadata.get('sha256'), str):
+                raise ValueError('Git recovery bundle unavailable: missing SHA-256')
             digest = hashlib.sha256()
             with destination.open('xb') as output:
                 for chunk in iter(lambda: process.stdout.read(1024 * 1024), b''):
@@ -310,11 +325,16 @@ def preserve_git(host, path, directory, state):
                 output.flush(); os.fsync(output.fileno())
             if process.wait() or digest.hexdigest() != metadata['sha256']:
                 raise RuntimeError('Git recovery bundle transfer failed')
+            if destination.stat().st_size == 0:
+                raise ValueError('Git recovery bundle unavailable: empty bundle')
         finally:
             process.stdout.close()
             if process.poll() is None:
                 process.terminate(); process.wait()
     destination.chmod(0o600)
+    with destination.open('rb') as stream:
+        if reclaim_probe.sha256_hex(stream) != metadata['sha256']:
+            raise RuntimeError('NAS Git recovery bundle SHA-256 mismatch')
     check_bundle(destination, state['head'], state['reflog'])
     return dict(head=state['head'], branch=state['branch'], remote=display_remote(state['remote']),
                 reflog=state['reflog'], **metadata)
@@ -352,6 +372,9 @@ def read_archive(archive_path):
     try:
         with archive_stream(archive_path) as stream, tarfile.open(fileobj=stream, mode='r|') as archive:
             for member in archive:
+                if member.issym() and member.name not in found:
+                    found[member.name] = dict(link=member.linkname)
+                    continue
                 if member.name in found or not (member.isdir() or member.isfile()):
                     raise ValueError('unexpected archive member')
                 found[member.name.rstrip('/')] = (reclaim_probe.sha256_hex(archive.extractfile(member))
@@ -457,7 +480,7 @@ def copy(host, path, root, records, initial, git, *, verify_copy=True):
     partial = final.with_suffix('.partial')
     receipt = final.with_suffix('.sha256.json')
     manifest_path = store._manifest_path(final)
-    store._pipe(lambda errors: hosts.python_stream(host, SOURCE, dict(operation='tar', path=path), stderr=errors),
+    store._pipe(lambda errors: hosts.python_stream(host, SOURCE, dict(operation='tar', path=path, **(dict(members=list(initial['manifest'])) if initial.get('agent') else {})), stderr=errors),
                 lambda source, errors: subprocess.Popen(compressor(partial), stdin=source, stderr=errors))
     found = read_archive(partial) if verify_copy else initial['manifest']
     if found != initial['manifest']:
@@ -483,8 +506,10 @@ def copy(host, path, root, records, initial, git, *, verify_copy=True):
     return record
 
 
-def preserve(host, path, root, before_remove, reflog=(), deadline=None, *, verify_copy=True):
-    initial = probe(host, 'manifest', path=path)
+def preserve(host, path, root, before_remove, reflog=(), deadline=None, *, verify_copy=True, agent=False):
+    options = dict(agent=True) if agent else {}
+    initial = probe(host, 'manifest', path=path, **options)
+    initial.update(options)
     root = Path(root)
     with store._index_lock(root, deadline):
         records = store._read_index(root)
@@ -499,7 +524,7 @@ def preserve(host, path, root, before_remove, reflog=(), deadline=None, *, verif
     final = store._archive_path(root, record)
     if not final.is_file() or final.stat().st_size != record.archive_bytes:
         raise ValueError('verified archive is no longer present')
-    current = probe(host, 'manifest', path=path)
+    current = probe(host, 'manifest', path=path, **options)
     if current['manifest'] != initial['manifest'] or current['security'] != initial['security']:
         raise ValueError('source changed after verified NAS copy')
     return record, initial['manifest'], initial['security']
@@ -587,9 +612,13 @@ def drill_candidate(root, scratch):
 def unlock_tree(path):
     for directory, names, files in os.walk(path):
         for name in names:
-            os.chmod(os.path.join(directory, name), 0o700)
+            path = os.path.join(directory, name)
+            if not os.path.islink(path):
+                os.chmod(path, 0o700)
         for name in files:
-            os.chmod(os.path.join(directory, name), 0o600)
+            path = os.path.join(directory, name)
+            if not os.path.islink(path):
+                os.chmod(path, 0o600)
 
 
 def restored_digests(target, root):
@@ -600,8 +629,12 @@ def restored_digests(target, root):
     for directory, names, files in os.walk(target):
         base = PurePosixPath(root, Path(directory).relative_to(target).as_posix())
         found[str(base)] = None
-        for name in files:
-            with (Path(directory) / name).open('rb') as stream:
+        for name in [*files, *(name for name in names if (Path(directory) / name).is_symlink())]:
+            path = Path(directory) / name
+            if path.is_symlink():
+                found[str(base / name)] = dict(link=os.readlink(path))
+                continue
+            with path.open('rb') as stream:
                 found[str(base / name)] = reclaim_probe.sha256_hex(stream)
     return found
 
@@ -711,8 +744,8 @@ def retention(path, days):
     return days
 
 
-def package_cache(path):
-    return reclaim_probe.package_cache(path)
+def package_cache(path, *, home=None):
+    return reclaim_probe.package_cache(path, home=home)
 
 
 def blocked(reason):
@@ -819,6 +852,22 @@ class Reclaimer:
         self.removed = 0; self.removed_bytes = 0; self.limit_reached = False
         self.discovered = []; self.discovery = None
         self.deadline = None
+        self.github = not config.get('no_gh')
+        if not self.github:
+            self.local_proof_note('--no-gh')
+
+    def local_proof_note(self, why):
+        self.report.notes.append(f'Pull requests not checked ({why}): only checkouts whose head is an ancestor of the published '
+                                 'default branch qualify, by local Git ancestry; closed, squash-merged and abandoned work stays held.')
+
+    def pull_requests(self, *key):
+        if self.github:
+            try:
+                return pull_requests(*key)
+            except GitHubUnavailable:
+                self.github = False
+                self.local_proof_note('GitHub CLI gh not found')
+        return None
 
     def unlisted(self):
         try:
@@ -844,17 +893,18 @@ class Reclaimer:
     def limit(self, key):
         return self.rules.get(key, self.config.get(key, rules.LIMIT_KEYS[key]))
 
-    def budget(self, size, reserve=True):
-        if not self.limit_reached:
-            self.limit_reached = (self.removed + 1 > self.limit('max_items_per_run')
-                                  or self.removed_bytes + size > self.limit('max_gib_per_run') * 1024**3)
-        if self.limit_reached:
+    def budget(self, size, reserve=True, *, skip_oversized=False):
+        if self.limit_reached or self.removed + 1 > self.limit('max_items_per_run'):
+            self.limit_reached = True
+            raise ValueError(LIMIT_REACHED)
+        if self.removed_bytes + size > self.limit('max_gib_per_run') * 1024**3:
+            self.limit_reached = not skip_oversized
             raise ValueError(LIMIT_REACHED)
         if reserve:
             self.removed += 1
             self.removed_bytes += size
 
-    def copy_source(self, path, recheck, reflog=()):
+    def copy_source(self, path, recheck, reflog=(), agent=False):
         if self.config.get('archive_before_delete', 'on') == 'off':
             if reflog:
                 raise ValueError('unpublished reflog history requires archive_before_delete')
@@ -863,6 +913,8 @@ class Reclaimer:
             return None, initial['manifest'], initial['security'], None
         drive = self.archive_target(path)
         options = {} if self.config.get('backup_copy_check', 'on') != 'off' else dict(verify_copy=False)
+        if agent:
+            options['agent'] = True
         saved, manifest, security = preserve(self.host, path, self.config['nas_root'],
                                              lambda: (recheck(), self.archive_target(path, drive)),
                                              reflog, self.deadline, **options)
@@ -896,7 +948,7 @@ class Reclaimer:
         return self.waiting_days(path, retention(path, max(self.config['archive_idle_days'] if value is None else value for value in days)))
 
     def gated(self, tier, patterns=()):
-        return tier == 'clone' or tier in self.config.get('approval', []) or any(
+        return tier in ('clone', 'rebuild') or tier in self.config.get('approval', []) or any(
             rules.archive_entry(self.rules, pattern)['approval'] for pattern in patterns)
 
     def check_approval(self, ident, tier, path):
@@ -986,15 +1038,36 @@ class Reclaimer:
             raise ValueError('origin changed during Git proof')
         key = repo, state['branch'], state['head']
         if fresh or key not in self.prs:
-            self.prs[key] = pull_requests(*key)
+            self.prs[key] = self.pull_requests(*key) or []
+        if not self.github and not state['branch']:
+            state['merged'] = False
         if state['published'] and not state['merged']:
             state['merged'] = self.merged(repo, state['head'], published_main(listing))
         state['squashed'] = state['published'] and not state['merged'] and any(
             row['state'] == 'MERGED' and self.merged(repo, state['head'], row['headRefOid']) for row in self.prs[key])
         return state, self.prs[key], listing
 
+    def largest_git_paths(self, paths):
+        if len(paths) < 2:
+            return paths
+        measured = {}
+        for start in range(0, len(paths), BATCH):
+            self.check_deadline('while measuring Git checkouts; 0 items done')
+            seconds = SIZE_SECONDS
+            if self.deadline is not None:
+                seconds = min(seconds, max(0, self.deadline - time.monotonic()))
+            chunk = paths[start:start + BATCH]
+            try:
+                sizes = probe(self.host, 'sizes', paths=chunk, seconds=seconds, parallel=True, timeout=seconds + 30)
+            except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+                continue
+            measured.update((path, size['bytes']) for path, size in zip(chunk, sizes))
+        return sorted(paths, key=lambda path: -measured.get(path, 0))
+
     def worktree_paths(self, paths):
         if self.apply:
+            if 'worktree' in self.config['live']:
+                paths = self.largest_git_paths(paths)
             yield from paths
             return
         for start in range(0, len(paths), BATCH):
@@ -1009,6 +1082,8 @@ class Reclaimer:
                     self.prefetched.pop(('repo', path, None), None)
 
     def prefetch_worktree_prs(self, paths):
+        if not self.github:
+            return
         try:
             results = probe(self.host, 'batch', requests=[dict(operation='repo', path=path) for path in paths])
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
@@ -1037,6 +1112,8 @@ class Reclaimer:
                 continue
 
     def merged(self, *check):
+        if not self.github:
+            return False
         if check not in self.merges:
             self.merges[check] = merged_on_github(*check)
         return self.merges[check]
@@ -1057,6 +1134,14 @@ class Reclaimer:
             try:
                 results = probe(self.host, 'batch', requests=chunk, activity=self.activity)
             except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+                if self.apply and 'archive' in self.config['live']:
+                    for request in (item for item in chunk if item['operation'] == 'guard'):
+                        self.check_deadline('while measuring archive candidates; 0 items done')
+                        try:
+                            info = probe(self.host, activity=self.activity, **request)
+                        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+                            continue
+                        self.prefetched['guard', request['path'], request['days']] = {'result': info}
                 continue
             for request, result in zip(chunk, results):
                 self.prefetched[request['operation'], request['path'], request.get('days')] = result
@@ -1083,15 +1168,18 @@ class Reclaimer:
     def broad_cwds(self):
         return [*self.rules.get('roots', []), *self.rules.get('shared_roots', [])]
 
-    def safe(self, path, days=0, allow_git=False, fresh=False, archive=False, gated=False, abandoned=False):
+    def safe(self, path, days=0, allow_git=False, fresh=False, archive=False, gated=False, abandoned=False, agent=False):
         if not fresh:
             self.load_activity()
             if self.activity['blocked']:
                 raise ValueError('; '.join(self.activity['blocked']))
-        info = self.ask('guard', path, fresh, activity=self.activity, **self.guard_options(days, gated))
+        options = self.guard_options(days, gated)
+        if agent:
+            options['agent'] = True
+        info = self.ask('guard', path, fresh or agent, activity=self.activity, **options)
         context = self.ask('context', path, fresh)
         contexts = (probe(self.host, 'repositories', path=path, reject_bare=True)
-                    if self.config.get('archive_before_delete', 'on') == 'off' or abandoned
+                    if self.config.get('archive_before_delete', 'on') == 'off' or abandoned or agent
                     else self.ask('repositories', path, fresh))
         if context and context not in contexts:
             contexts.append(context)
@@ -1105,7 +1193,7 @@ class Reclaimer:
                 continue
             inside = os.path.normcase(context.replace('\\', '/')).startswith(os.path.normcase(path.replace('\\', '/')).rstrip('/') + '/')
             same = os.path.normcase(context.replace('\\', '/')) == os.path.normcase(path.replace('\\', '/'))
-            if abandoned and inside:
+            if (abandoned or agent) and inside:
                 raise ValueError('nested repository inside abandoned work')
             if (inside or archive and same) and self.config.get('archive_before_delete', 'on') == 'off':
                 raise ValueError('Git repositories require archive_before_delete; use the clone or worktree tier')
@@ -1121,12 +1209,15 @@ class Reclaimer:
                     repo = repository(state['remote'])
                     key = repo, state['branch'], state['head']
                     if fresh or key not in self.prs:
-                        self.prs[key] = pull_requests(*key)
+                        found = self.pull_requests(*key)
+                        if found is None:
+                            raise ValueError('IN USE: pull request state unknown without the GitHub CLI')
+                        self.prs[key] = found
                     if any(row['state'] == 'OPEN' for row in self.prs[key]):
                         problem = 'IN USE: open pull request'
             else:
                 state, prs, _ = self.proof(context, fresh)
-                problem = '' if abandoned and same and abandoned_work(state, prs) else completion(state, prs)
+                problem = '' if abandoned and same and self.github and abandoned_work(state, prs, agent) else completion(state, prs)
             if problem:
                 raise ValueError(problem)
             allow_git = True
@@ -1142,7 +1233,7 @@ class Reclaimer:
                  else protect.overlaps(path, reference, True))]
             reason = 'scheduler references ' + ', '.join(references) if references else ''
         else:
-            reason = protection.reason(path, allow_git=allow_git) if fresh or path not in self.checked else self.checked[path]
+            reason = protection.reason(path, allow_git=allow_git, internal_links=agent) if fresh or path not in self.checked else self.checked[path]
         blocked(reason)
         return info
 
@@ -1152,7 +1243,14 @@ class Reclaimer:
         self.report.errors.extend('Worktree discovery incomplete: ' + error for error in discovery['errors'])
         self.report.notes.extend(discovery['notes'])
         self.check_deadline('while preparing, before the protection check; 0 items done')
-        self.checked = self.protection.batch(paths, allow_git=True) if self.host.kind != 'powershell' else {}
+        agent_paths = set()
+        if (self.host.ssh is None and self.host.kind == 'posix'
+                and self.host.name in self.config.get('agent_worktree_hosts', [])
+                and self.config.get('archive_before_delete', 'on') == 'on'
+                and self.config.get('backup_copy_check', 'on') == 'on'):
+            agent_paths = {path for path in paths if reclaim_probe.agent_path(path)}
+        self.checked = (self.protection.batch(paths, allow_git=True, internal_links=agent_paths)
+                        if self.host.kind != 'powershell' else {})
         try:
             for done, path in enumerate(self.worktree_paths(paths)):
                 self.check_deadline(f'after {done} of {len(paths)} items')
@@ -1160,7 +1258,10 @@ class Reclaimer:
                 rule = self.rule('roots', discovery['roots'][path])
                 try:
                     local = self.ask('repo', path, False)
-                    if local['stashes'] or local['dirty'] and not self.idle_enough(path):
+                    agent = path in agent_paths and local['agent_worktree']
+                    abandoned_days = (max(reclaim_probe.AGENT_WORKTREE_IDLE_DAYS, self.config.get('wait_period_days', 0))
+                                      if agent else self.config['abandoned_idle_days'])
+                    if local['stashes'] or local['dirty'] and not self.idle_enough(path, abandoned_days, agent):
                         raise ValueError('IN USE: uncommitted work or stashes')
                     try:
                         state, prs, listing = self.proof(path)
@@ -1171,9 +1272,9 @@ class Reclaimer:
                     reason = completion(state, prs)
                     if reason.startswith('UNIQUE: unpushed'):
                         reason += ': head ' + state['head'][:12] + ' is not on ' + display_remote(state['remote'])
-                    if reason and abandoned_work(state, prs):
-                        days = self.config['abandoned_idle_days']
-                        self.abandoned(path, rule, days, state, prs, reason)
+                    if reason and self.github and abandoned_work(state, prs, agent):
+                        days = abandoned_days
+                        self.abandoned(path, rule, days, state, prs, reason, agent)
                         continue
                     if local['dirty']:
                         raise ValueError('IN USE: uncommitted work or stashes')
@@ -1182,13 +1283,17 @@ class Reclaimer:
                     days = (min(self.config['worktree_idle_days'], WORKTREE_MERGED_DAYS)
                             if state['merged'] else self.config['worktree_idle_days'])
                     days = self.waiting_days(path, days)
+                    if agent:
+                        days = abandoned_days
+                        if state['index_only'] or any(row['state'] == 'OPEN' for row in prs):
+                            raise ValueError('IN USE: active Git work')
                     if self.config.get('archive_before_delete', 'on') == 'off':
                         if state['reflog']:
                             raise ValueError('unpublished reflog history requires archive_before_delete')
                         if state['ignored'] and (self.host.kind == 'powershell' or 'nas_root' not in self.config):
                             raise ValueError('ignored files require archive_before_delete')
                     gated = self.gated('worktree')
-                    info = self.safe(path, days, True, gated=gated)
+                    info = self.safe(path, days, True, gated=gated, agent=agent)
                     size = info['bytes']
                     ident = item_id(self.host.name, 'worktree', path, info, state['head'])
                     if not self.apply or 'worktree' not in self.config['live']:
@@ -1209,7 +1314,7 @@ class Reclaimer:
                         problem = completion(current, current_prs)
                         if problem or current['head'] != state['head']:
                             raise ValueError(problem or 'head changed after preview')
-                        checked = self.safe(path, days, True, True, gated=gated)
+                        checked = self.safe(path, days, True, True, gated=gated, agent=agent)
                         if gated and item_id(self.host.name, 'worktree', path, checked, state['head']) != ident:
                             raise ValueError(APPROVAL_STALE)
                         return checked
@@ -1217,20 +1322,22 @@ class Reclaimer:
                         raise ValueError(LIMIT_REACHED)
                     probe(self.host, 'allowed', path=path, worktree=True)
                     fresh = recheck()['bytes']
-                    self.budget(fresh, reserve=False)
+                    self.budget(fresh, reserve=False, skip_oversized=True)
                     manifest = None; saved = None; security = None
-                    if state['ignored'] or state['reflog']:
-                        saved, manifest, security, drive = self.copy_source(path, recheck, state['reflog'])
+                    if agent:
+                        state['reflog'] = probe(self.host, 'repo', path=path, listing=listing, abandoned=True)['reflog']
+                    if agent or state['ignored'] or state['reflog']:
+                        saved, manifest, security, drive = self.copy_source(path, recheck, state['reflog'], agent)
                     current, current_prs, listing = self.proof(path, True)
                     if completion(current, current_prs) or current['head'] != state['head']:
                         raise ValueError('Git completion changed before removal')
                     if saved:
                         self.archive_present(path, drive, saved)
-                    self.budget(max(fresh, saved.original_bytes if saved else 0))
+                    self.budget(max(fresh, saved.original_bytes if saved else 0), skip_oversized=True)
                     removed = probe(self.host, 'remove', path=path, days=days, protected=self.rules.get('protected', []), broad=self.broad_cwds(),
                                     head=state['head'], branch=current['branch'], remote=current['remote'],
                                     listing=listing, manifest=manifest, security=security, keep=self.keep(saved),
-                                    reflog=state['reflog'], digest=info['digest'] if gated else None)
+                                    agent=agent, reflog=state['reflog'], digest=info['digest'] if gated else None)
                     action = 'remove worktree and local branch' if removed['branch_removed'] else 'remove worktree; retain local branch'
                     self.log('worktree', path, action, size,
                              'DURABLE ELSEWHERE: published merged/closed head; clean, no process, T3 or Codex use' +
@@ -1248,23 +1355,24 @@ class Reclaimer:
         finally:
             self.size_skips()
 
-    def idle_enough(self, path):
+    def idle_enough(self, path, days, agent):
         try:
             self.load_activity()
             probe(self.host, 'guard', path=path, activity=self.activity,
-                  **self.guard_options(self.config['abandoned_idle_days'], True))
+                  agent=agent, **self.guard_options(days, True))
         except ValueError:
             return False
         return not self.activity['blocked']
 
-    def abandoned(self, path, rule, days, state, prs, reason):
+    def abandoned(self, path, rule, days, state, prs, reason, agent=False):
         try:
-            info = self.safe(path, days, True, gated=True, abandoned=True)
+            info = self.safe(path, days, True, gated=True, abandoned=True, agent=agent)
         except ValueError:
             raise ValueError(reason) from None
         size = info['bytes']
         ident = item_id(self.host.name, 'worktree', path, info, 'abandoned ' + state['head'])
-        why = f'ABANDONED: {reason}; idle {days} days; approval required; whole tree and Git history go to a verified NAS copy'
+        contents = 'source' if agent else 'whole tree'
+        why = f'ABANDONED: {reason}; idle {days} days; approval required; {contents} and Git history go to a verified NAS copy'
         fields = dict(rule=rule, idle_days=days, head=state['head'], branch=state['branch'], remote=state['remote'],
                       pull_requests=[row['url'] for row in prs if row['headRefOid'] == state['head']])
         if not self.apply or 'worktree' not in self.config['live']:
@@ -1279,12 +1387,12 @@ class Reclaimer:
             raise ValueError(f'{reason}; {exc}') from None
         def still_abandoned():
             current, current_prs, listing = self.proof(path, True)
-            if current['head'] != state['head'] or not abandoned_work(current, current_prs):
+            if current['head'] != state['head'] or not self.github or not abandoned_work(current, current_prs, agent):
                 raise ValueError('Git state changed after preview')
             return current, listing
         def recheck():
             still_abandoned()
-            checked = self.safe(path, days, True, True, gated=True, abandoned=True)
+            checked = self.safe(path, days, True, True, gated=True, abandoned=True, agent=agent)
             if item_id(self.host.name, 'worktree', path, checked, 'abandoned ' + state['head']) != ident:
                 raise ValueError(APPROVAL_STALE)
             return checked
@@ -1292,17 +1400,17 @@ class Reclaimer:
             raise ValueError(LIMIT_REACHED)
         probe(self.host, 'allowed', path=path, worktree=True)
         fresh = recheck()['bytes']
-        self.budget(fresh, reserve=False)
+        self.budget(fresh, reserve=False, skip_oversized=True)
         _, listing = still_abandoned()
         reflog = probe(self.host, 'repo', path=path, listing=listing, abandoned=True)['reflog']
-        saved, manifest, security, drive = self.copy_source(path, recheck, reflog)
+        saved, manifest, security, drive = self.copy_source(path, recheck, reflog, agent)
         current, listing = still_abandoned()
         self.archive_present(path, drive, saved)
-        self.budget(max(fresh, saved.original_bytes))
+        self.budget(max(fresh, saved.original_bytes), skip_oversized=True)
         removed = probe(self.host, 'remove', path=path, days=days, protected=self.rules.get('protected', []), broad=self.broad_cwds(),
                         head=state['head'], branch=current['branch'], remote=current['remote'], listing=listing,
                         manifest=manifest, security=security, keep=self.keep(saved), reflog=reflog,
-                        digest=info['digest'], abandoned=True)
+                        digest=info['digest'], abandoned=True, agent=agent)
         self.log('worktree', path, 'archive abandoned worktree; retain local branch', size,
                  why + '; SHA-256 verified at ' + saved.archive_path, merged=removed['merged'], **fields)
         self.consume(ident)
@@ -1352,7 +1460,8 @@ class Reclaimer:
                     continue
             raise ValueError('KEEP: only checkout of ' + key + ' on this host')
         try:
-            for done, path in enumerate(sorted(paths, key=lambda item: (len(item), item), reverse=True)):
+            ordered = sorted(paths, key=lambda item: (len(item), item), reverse=True)
+            for done, path in enumerate(self.largest_git_paths(ordered)):
                 self.check_deadline(f'after {done} of {len(paths)} items')
                 size = 0
                 rule = self.rule('roots', discovery['roots'][path])
@@ -1366,7 +1475,8 @@ class Reclaimer:
                     size = info['bytes']
                     ident = item_id(self.host.name, 'clone', path, info, state['head'])
                     if not self.apply or 'clone' not in self.config['live']:
-                        gone.add(path)
+                        if size <= self.limit('max_gib_per_run') * 1024**3:
+                            gone.add(path)
                         self.log('clone', path, 'would remove clone', size,
                                  'DURABLE ELSEWHERE: every local ref, HEAD and reflog is on GitHub; another checkout remains; ' +
                                  ('the clone requires a verified NAS copy' if self.config.get('archive_before_delete', 'on') != 'off' and self.config.get('backup_copy_check', 'on') != 'off' else
@@ -1388,11 +1498,11 @@ class Reclaimer:
                         raise ValueError(LIMIT_REACHED)
                     probe(self.host, 'allowed', path=path, worktree=True)
                     fresh = recheck()['bytes']
-                    self.budget(fresh, reserve=False)
+                    self.budget(fresh, reserve=False, skip_oversized=True)
                     saved, manifest, security, drive = self.copy_source(path, recheck)
                     if saved:
                         self.archive_present(path, drive, saved)
-                    self.budget(max(fresh, saved.original_bytes if saved else 0))
+                    self.budget(max(fresh, saved.original_bytes if saved else 0), skip_oversized=True)
                     probe(self.host, 'remove', path=path, days=days, protected=self.rules.get('protected', []), broad=self.broad_cwds(), clone=True,
                           manifest=manifest, security=security, keep=self.keep(saved), digest=info['digest'])
                     gone.add(path)
@@ -1407,6 +1517,53 @@ class Reclaimer:
                     self.log('clone', path, 'error', size, str(exc), rule=rule, idle_days=days)
         finally:
             self.size_skips()
+
+    def rebuilds(self):
+        if self.host.kind != 'posix':
+            self.report.notes.append('Rebuildable cache pass skipped: POSIX hosts only')
+            return
+        discovery = self.discovery or probe(self.host, 'discover', roots=self.rules.get('roots', []))
+        days = self.config.get('wait_period_days', self.config['worktree_idle_days'])
+        removed = {row['path'] for row in self.report.actions if row['action'].startswith('remove')}
+        checkouts = [path for path in [*discovery['paths'], *discovery['clones']] if path not in removed]
+        try:
+            for done, checkout in enumerate(checkouts):
+                self.check_deadline(f'after {done} of {len(checkouts)} checkouts')
+                try:
+                    found = probe(self.host, 'rebuildable', path=checkout)
+                except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
+                    self.report.notes.append(f'Rebuildable cache scan skipped {checkout}: {describe(exc)}')
+                    continue
+                for item in found:
+                    self.rebuild(checkout, item, days, self.rule('roots', discovery['roots'][checkout]))
+        finally:
+            self.size_skips()
+
+    def rebuild(self, checkout, item, days, rule):
+        path, size = item['path'], 0
+        why = ('REBUILDABLE: ignored by Git and rebuilt from ' + ', '.join(PurePosixPath(proof).name for proof in item['proof'])
+               + '; idle, not in use; deleted without a NAS copy')
+        try:
+            self.load_activity()
+            if self.activity['blocked']:
+                raise ValueError('; '.join(self.activity['blocked']))
+            info = probe(self.host, 'guard', path=path, activity=self.activity, rebuild=checkout, **self.guard_options(days, True))
+            size = info['bytes']
+            blocked(self.protection.reason(path, internal_links=True))
+            ident = item_id(self.host.name, 'rebuild', path, info, checkout)
+            if not self.apply:
+                self.log('rebuild', path, 'would delete rebuildable cache', size, why, rule=rule, idle_days=days, id=ident, approval=True)
+                return
+            self.check_approval(ident, 'rebuild', path)
+            self.budget(size, skip_oversized=True)
+            done = probe(self.host, 'rebuild-remove', path=path, checkout=checkout, days=days, digest=info['digest'],
+                         protected=self.rules.get('protected', []), broad=self.broad_cwds())
+            self.log('rebuild', path, 'delete rebuildable cache', done['bytes'], why, rule=rule, idle_days=days)
+            self.consume(ident)
+        except ValueError as exc:
+            self.skip('rebuild', path, size, str(exc), rule=rule, idle_days=days)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            self.log('rebuild', path, 'error', size, describe(exc), rule=rule, idle_days=days)
 
     def restore_command(self, ident):
         local = ' --local' if self.host.ssh is None and self.rules.get('ssh') else ''
@@ -1469,20 +1626,34 @@ class Reclaimer:
         listed = rules.archive_patterns(self.rules)
         children = [entry['path'] for entry in self.rules.get('archive', [])
                     if isinstance(entry, dict) and 'age_days' in entry]
+        containers = [entry['path'] for entry in self.rules.get('archive', [])
+                      if isinstance(entry, dict) and entry.get('children')]
         patterns = probe(self.host, 'expand', patterns=listed, children=children,
+                         containers=containers,
                          exclude={pattern: rules.archive_entry(self.rules, pattern)['exclude'] for pattern in listed})
         self.check_deadline('while preparing archive patterns; 0 items done')
         restored = self.quarantines()
         paths = list(patterns)
+        home = self.protection.home if isinstance(self.protection, protect.Protection) else None
+        packages = {path for path in paths if package_cache(path, home=home)}
         tagged = {}
         for pattern in listed:
             if rules.archive_entry(self.rules, pattern)['category']:
                 self.check_deadline('while preparing archive patterns; 0 items done')
-                tagged[pattern] = set(probe(self.host, 'expand', patterns=[pattern], children=children, exclude={}))
+                tagged[pattern] = set(probe(self.host, 'expand', patterns=[pattern], children=children,
+                                            containers=containers, exclude={}))
         self.checked = {}
         self.prefetch([(path, self.archive_days(patterns[path], path), self.gated('archive', patterns[path]))
-                       for path in paths if not package_cache(path)])
-        if not self.apply and self.host.kind != 'powershell':
+                       for path in paths if path not in packages])
+        if self.apply and 'archive' in self.config['live']:
+            measured = {path: row['result']['bytes'] for (operation, path, _), row in self.prefetched.items()
+                        if operation == 'guard' and 'result' in row}
+            byte_limit = self.limit('max_gib_per_run') * 1024**3
+            slots = [index for index, path in enumerate(paths) if path in measured and measured[path] <= byte_limit]
+            largest_first = sorted((paths[index] for index in slots), key=measured.__getitem__, reverse=True)
+            for index, path in zip(slots, largest_first):
+                paths[index] = path
+        if self.host.kind != 'powershell':
             guarded = list(dict.fromkeys(path for (operation, path, _), found in self.prefetched.items()
                                          if operation == 'guard' and 'result' in found
                                          and self.prefetched.get(('context', path, None)) == {'result': None}
@@ -1500,7 +1671,7 @@ class Reclaimer:
                 exclude = [item for pattern in patterns[path] for item in rules.archive_entry(self.rules, pattern)['exclude']]
                 days = None
                 try:
-                    if package_cache(path):
+                    if path in packages:
                         raise ValueError('package caches are excluded')
                     if any(protect.overlaps(path, target, self.host.kind == 'powershell') for target in restored):
                         raise ValueError('recently restored from quarantine')

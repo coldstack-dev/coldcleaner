@@ -4,6 +4,7 @@ import re
 import shlex
 from html import escape
 import socket
+import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -231,6 +232,8 @@ def snapshot(directory, reports, plan, policy, scanned):
         state[entry.name] = dict(rows=entry.actions, plan=str(plan.resolve()) if plan else None,
                                  rules_sha256=policy, errors=entry.errors, scanned=at,
                                  managed_complete=not report.managed_partial(entry))
+        if not state[entry.name]['managed_complete']:
+            state[entry.name]['coverage_details'] = [note for note in entry.notes if report.coverage_note(note)]
     temporary = path.with_suffix('.tmp')
     try:
         temporary.write_text(json.dumps(state))
@@ -464,7 +467,7 @@ def prune(config, current_report, current_plan):
                     kept_plans.add(path)
                     break
 
-        with reclaim.approvals(directory) as approvals, (directory / 'reclaim-actions.lock').open('a') as log_lock:
+        with reclaim.approvals(directory) as approvals, (directory / 'reclaim-actions.lock').open('a+') as log_lock:
             locking.lock(log_lock, shared=True)
             state = read_snapshot(directory)
             if not isinstance(state, dict) or not all(isinstance(row, dict) for row in state.values()):

@@ -2,6 +2,7 @@ import re
 from collections import Counter
 
 from . import fleet, reclaim, report
+from .report_files import host_lines, reclaim_mode, timestamp, written
 
 DEPENDENCIES = {'.venv': ('venv', 'python'), 'venv': ('venv', 'python'), 'node_modules': ('node_modules', 'node')}
 TOOLS = {'.t3': 't3', '.codex': 'codex', '.claude': 'claude'}
@@ -47,16 +48,47 @@ def candidates(rows):
     return report.remaining(pending, removed)
 
 
+def saved_coverage_notes(directory, host, entry):
+    scanned = timestamp(entry['scanned'], fleet.SNAPSHOT)
+    for path in report.paths(directory):
+        if written(path) < scanned:
+            continue
+        try:
+            text = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeError):
+            continue
+        lines = text.splitlines()
+        if f'Rules: sha256 {entry["rules_sha256"]}' not in lines or not reclaim_mode(lines):
+            continue
+        lines = host_lines(text, host)
+        if any(line.startswith(report.MANAGED) and line.endswith('; coverage partial') for line in lines):
+            notes = (line.removeprefix('- Note: ') for line in lines if line.startswith('- Note: '))
+            return [note for note in notes if report.coverage_note(note)]
+    return []
+
+
 def breakdown(config, hosts):
     state = fleet.read_snapshot(config['report_dir'])
-    scanned, missing, items = {}, [], []
+    scanned, missing, partial, items = {}, [], {}, []
     for host in hosts:
         entry = state.get(host.name)
-        if not entry or entry['rules_sha256'] != config['rules_sha256'] or entry.get('managed_complete') is not True:
+        if not entry or entry['rules_sha256'] != config['rules_sha256'] or 'managed_complete' not in entry:
             missing.append(host.name)
             continue
+        rows = entry['rows']
+        if not entry['managed_complete']:
+            if (entry.get('errors') or rows) and all(row['action'] == 'error' for row in rows):
+                missing.append(host.name)
+                continue
+            notes = entry.get('coverage_details')
+            if notes is None:
+                notes = saved_coverage_notes(config['report_dir'], host.name, entry)
+            partial[host.name] = [
+                *notes, *entry.get('errors', []),
+                *(f"{row['path']}: {row['reason']}" for row in rows if row['action'] == 'error'),
+            ]
         scanned[host.name] = entry['scanned']
-        for row, size in candidates(entry['rows']):
+        for row, size in candidates(rows):
             if not size:
                 continue
             repo, tool, category = attribution(row)
@@ -69,14 +101,23 @@ def breakdown(config, hosts):
         for item in items:
             counts[item[field]] += item['bytes']
         totals[field] = dict(counts.most_common())
-    return dict(status='incomplete' if missing else 'ok', scanned=scanned, missing_hosts=missing, items=items, totals=totals)
+    result = dict(status='incomplete' if missing else 'ok', scanned=scanned, missing_hosts=missing, items=items, totals=totals)
+    if partial:
+        if not missing:
+            result['status'] = 'partial'
+        result['partial_hosts'] = partial
+    return result
 
 
 def print_breakdown(result):
+    for host, details in result.get('partial_hosts', {}).items():
+        print(f'WARNING: {host} scan coverage is partial.')
+        for detail in details or ['The saved scan has no coverage details.']:
+            print(f'  {report.cell(detail)}')
     for host, scanned in result['scanned'].items():
         print(f'{host} scanned {scanned}')
     for host in result['missing_hosts']:
-        print(f'{host} has no complete scan under the current rules')
+        print(f'{host} has no scan under the current rules')
     if result['items']:
         print('Bytes\tHost\tRepo\tTool\tCategory\tApproval\tPath')
         for row in result['items']:

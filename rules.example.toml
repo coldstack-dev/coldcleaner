@@ -14,6 +14,7 @@ attention_note = "~/.local/state/coldcleaner/attention.md"
 memory_store = "~/.local/state/coldvault/preservation" # Receipts that make artifact entries eligible; never cleaned.
 actions_log_mb = 10
 collect_hosts = []
+agent_worktree_hosts = []
 max_items_per_run = 200 # Per host; a host table may override it.
 max_gib_per_run = 100 # Per host; a host table may override it.
 live = []
@@ -47,8 +48,10 @@ exclude = [] # Paths or globs never archived; an archive match equal to, inside 
 # ssh = "windows.example.invalid"
 # roots = ['%USERPROFILE%\REPOS']
 
-# On a POSIX host, use an archive table such as
+# Match scratch children directly. Mark a directory with children = true when
+# a wider rule would otherwise select the directory itself.
+# archive = ["~/projects/*/.scratch/*", "/tmp/*", { path = "/tmp/claude-1000", children = true }]
+# The POSIX host-local archive allowlist must also match the child paths.
+
+# Use age_days = 30, 60 or 90 on a POSIX archive table to include hidden children.
 # archive = [{ path = "~/projects/*/.scratch", age_days = 60 }]
-# to archive and remove individual children idle for 30, 60 or 90 days.
-# Omit age_days to keep normal whole-path archive behavior. Do not combine it with days.
-# The host-local archive allowlist must also match the child paths, including hidden ones.

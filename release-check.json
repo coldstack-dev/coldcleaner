@@ -293,6 +293,48 @@
       "path": "tests/test_reclaim.py",
       "fingerprint": "3de132cd98be7bf2",
       "reason": "Public Git SSH URL syntax with the fixed git user, not a personal identity."
+    },
+    {
+      "scope": "tree",
+      "kind": "manual-review",
+      "path": ".github/workflows/verify.yml",
+      "fingerprint": "138dada3b6f74cbc",
+      "reason": "Reviewed read-only Coldbox job with same-repository pull request guard and no persisted checkout credential."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "tests/test_core.py",
+      "fingerprint": "6c56c3de95f09c47",
+      "reason": "A systemd template unit instance name in a test fixture, not an email address."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "tests/test_reclaim.py",
+      "fingerprint": "e4962f40f9a736a1",
+      "reason": "A fake Git SSH remote on the reserved .invalid domain in a test fixture, not a personal identity."
+    },
+    {
+      "scope": "history",
+      "kind": "manual-review",
+      "path": ".github/workflows/verify.yml",
+      "fingerprint": "138dada3b6f74cbc",
+      "reason": "Reviewed read-only Coldbox job with same-repository pull request guard and no persisted checkout credential."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "tests/test_core.py",
+      "fingerprint": "6c56c3de95f09c47",
+      "reason": "A systemd template unit instance name in a test fixture, not an email address."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "tests/test_reclaim.py",
+      "fingerprint": "e4962f40f9a736a1",
+      "reason": "A fake Git SSH remote on the reserved .invalid domain in a test fixture, not a personal identity."
     }
   ]
 }

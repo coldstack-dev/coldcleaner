@@ -1,6 +1,6 @@
 """Stdlib probe sent to a cleanup host; every operation uses an explicit path."""
 import hashlib
-from contextlib import closing
+from contextlib import ExitStack, closing
 from datetime import datetime, timezone
 import json
 import os
@@ -16,6 +16,63 @@ import time
 
 if __package__:
     from .locking import lock
+
+
+AGENT_WORKTREE_IDLE_DAYS = 3
+AGENT_ROOTS = ('worktrees', '.t3/worktrees', '.codex/worktrees', '.cursor/worktrees', 'conductor/workspaces')
+NODE_LOCKS = ('package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb')
+PYTHON_MANIFESTS = ('pyproject.toml', 'setup.py', 'setup.cfg', 'requirements.txt', 'Pipfile', 'uv.lock', 'poetry.lock')
+REBUILDABLE = {
+    'node_modules': (('package.json',), NODE_LOCKS, True),
+    'target': (('Cargo.toml',), (), False),
+    **{name: ((), PYTHON_MANIFESTS, False) for name in ('.venv', 'venv', '.pytest_cache', '.mypy_cache', '.ruff_cache')},
+}
+CARGO_ENTRIES = {'debug', 'release', 'doc', 'package', 'tmp', 'rls', 'CACHEDIR.TAG', '.rustc_info.json', '.cargo-lock'}
+NODE_MARKERS = ('.package-lock.json', '.yarn-integrity', '.modules.yaml', '.yarn-state.yml', '.pnpm')
+VENV_ENTRIES = {'bin', 'lib', 'lib64', 'include', 'share', 'etc', 'Scripts', 'Lib', 'Include', 'pyvenv.cfg', '.gitignore',
+                'CACHEDIR.TAG', '.lock'}
+NODE_HIDDEN = {'.bin', '.cache', '.vite', '.vite-temp', '.esbuild', '.turbo', *NODE_MARKERS}
+PYTHON_LIB_ENTRIES = {'site-packages', 'dist-packages', 'lib-dynload'}
+PYTEST_ENTRIES = {('README.md', False), ('.gitignore', False), ('CACHEDIR.TAG', False), ('v', True), ('v/cache', True),
+                  ('v/cache/nodeids', False), ('v/cache/lastfailed', False), ('v/cache/stepwise', False)}
+MYPY_ENTRIES = {'CACHEDIR.TAG', '.gitignore', 'plugins_snapshot.json', 'missing_stubs'}
+MYPY_SUFFIXES = ('.meta.json', '.data.json', '.ff')
+MYPY_SQLITE_SIDECARS = ('cache.db-wal', 'cache.db-shm', 'cache.db-journal')
+
+
+def write_agent_tar(path, members, output):
+    root = Path(path)
+    members = set(members)
+    with tarfile.open(fileobj=output, mode='w|') as archive:
+        for base, dirs, files, fd in os.fwalk(root, follow_symlinks=False):
+            prefix = Path(base).relative_to(root.parent)
+            dirs[:] = [name for name in dirs if str(prefix / name) in members]
+            for name in ['.', *files, *dirs]:
+                member = str(prefix / name)
+                if member not in members:
+                    continue
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                item = tarfile.TarInfo(member)
+                item.mode = stat.S_IMODE(info.st_mode)
+                item.mtime = info.st_mtime
+                if stat.S_ISDIR(info.st_mode):
+                    if name == '.':
+                        item.type = tarfile.DIRTYPE
+                        archive.addfile(item)
+                elif stat.S_ISLNK(info.st_mode):
+                    target = internal_link(Path(base) / name, root, root)
+                    item.type = tarfile.SYMTYPE
+                    item.linkname = target
+                    archive.addfile(item)
+                elif stat.S_ISREG(info.st_mode):
+                    with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd), 'rb') as source:
+                        current = os.fstat(source.fileno())
+                        if not os.path.samestat(info, current):
+                            raise ValueError('source changed while archiving')
+                        item.size = current.st_size
+                        archive.addfile(item, source)
+                else:
+                    raise ValueError('special file: ' + member)
 
 
 def sha256_hex(stream):
@@ -186,6 +243,16 @@ def contained(path, root):
     return Path(os.path.normcase(os.path.abspath(path))).is_relative_to(root)
 
 
+def agent_path(path):
+    home = Path.home()
+    path = Path(path)
+    if not path.is_relative_to(home):
+        return False
+    parts = path.relative_to(home).parts[:-1]
+    return (any(home / root in path.parents for root in AGENT_ROOTS) or '.worktrees' in parts
+            or any(parts[index:index + 2] == ('.claude', 'worktrees') for index in range(len(parts))))
+
+
 def threads():
     root = Path.home() / '.t3/userdata'
     database = root / 'statev2.sqlite'
@@ -203,7 +270,7 @@ def threads():
                 not row.get('settledOverride') and
                 (row.get('settledAt') or '') > (row.get('unsettledAt') or ''))
             if running or row.get('pinnedAt') or row.get('pinOrderKey') is not None or (
-                    not (row.get('archivedAt') or archived) and not settled):
+                    not settled and (not (row.get('archivedAt') or archived) or agent_path(row.get('worktreePath') or ''))):
                 if row.get('worktreePath'):
                     paths.append(row['worktreePath'])
                 elif row.get('projectId'):
@@ -253,12 +320,13 @@ def record_cwds(value, session, parents=()):
             yield from record_cwds(item, session)
 
 
-def claude_cwds(content, session):
-    lines = content.split(b'\n')
-    if lines[-1] and not lines[-1].strip(b'\0') and any(line.strip() for line in lines[:-1]):
-        lines.pop()
+def claude_cwds(lines, session):
+    earlier = False
     for line in lines:
+        if earlier and not line.endswith(b'\n') and not line.strip(b'\0'):
+            return
         if line.strip():
+            earlier = True
             try:
                 record = json.loads(line, object_pairs_hook=unique_keys)
             except ValueError:
@@ -271,11 +339,46 @@ def windows_cwd(cwd):
     return drive[1].upper() + ':\\' + (drive[2] or '').strip('/').replace('/', '\\') if drive else cwd
 
 
-def claude_threads(since=None):
+CLAUDE_SESSION_CACHE = '~/.cache/coldcleaner/claude-sessions.json'
+
+
+def load_session_cache():
+    try:
+        found = json.loads(Path(expanded(CLAUDE_SESSION_CACHE)).read_text())
+    except (OSError, ValueError):
+        return {}
+    valid = lambda entry: (isinstance(entry, dict) and isinstance(entry.get('stat'), list) and len(entry['stat']) == 5
+                           and all(type(item) is int for item in entry['stat'])
+                           and isinstance(entry.get('cwds'), list) and all(isinstance(cwd, str) for cwd in entry['cwds']))
+    return found if isinstance(found, dict) and all(valid(entry) for entry in found.values()) else {}
+
+
+RACY_SECONDS = 2
+
+
+def session_key(session):
+    status = session.stat()
+    return status.st_mtime, [status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns]
+
+
+def read_session(session, cache):
+    for _ in range(3):
+        updated, key = session_key(session)
+        entry = cache.get(str(session))
+        if not (entry and entry['stat'] == key and time.time() - updated >= RACY_SECONDS):
+            with session.open('rb') as lines:
+                entry = dict(stat=key, cwds=sorted(set(claude_cwds(lines, session))))
+        if session_key(session)[1] == key:
+            return updated, entry
+    raise ValueError('Claude Code session kept changing while it was read: ' + str(session))
+
+
+def claude_threads(since=None, cached=True):
     root = Path.home() / '.claude' / 'projects'
     if not os.path.lexists(root):
         return None
     latest = {}
+    cache, seen = load_session_cache() if cached else {}, {}
     for directory, folders, names in os.walk(root, onerror=raise_error):
         for name in folders + names:
             if os.path.islink(os.path.join(directory, name)):
@@ -285,17 +388,20 @@ def claude_threads(since=None):
                 continue
             session = Path(directory) / name
             try:
-                updated = session.stat().st_mtime
-                if since is not None and updated <= since:
+                if since is not None and session.stat().st_mtime <= since:
+                    if str(session) in cache:
+                        seen[str(session)] = cache[str(session)]
                     continue
-                content = session.read_bytes()
+                updated, seen[str(session)] = read_session(session, cache)
             except FileNotFoundError:
                 continue
-            for cwd in set(claude_cwds(content, session)):
+            for cwd in seen[str(session)]['cwds']:
                 cwd = windows_cwd(cwd) if os.name == 'nt' and cwd.startswith('/') else cwd
                 if '\0' in cwd or not os.path.isabs(cwd) and not (os.name == 'nt' and cwd.startswith('/')):
                     raise ValueError('unexpected cwd in ' + str(session))
                 latest[cwd] = max(latest.get(cwd, updated), updated)
+    if cached and seen != cache:
+        save_size_cache(CLAUDE_SESSION_CACHE, seen)
     broad = {os.path.normcase(str(Path.home())), os.path.normcase(os.path.abspath(os.sep))}
     return [(cwd, updated) for cwd, updated in latest.items() if os.path.normcase(os.path.abspath(cwd)) not in broad]
 
@@ -305,9 +411,9 @@ def t3_threads():
     return None if found is None else [(path, None) for path in found]
 
 
-def workspaces(since=None):
+def workspaces(since=None, cached=True):
     found, notes, blocked = [], [], []
-    for name, detect in (('T3', t3_threads), ('Codex', codex_threads), ('Claude Code', lambda: claude_threads(since))):
+    for name, detect in (('T3', t3_threads), ('Codex', codex_threads), ('Claude Code', lambda: claude_threads(since, cached))):
         try:
             result = detect()
         except Exception as error:
@@ -719,9 +825,32 @@ def mount_boundary(path):
         raise ValueError('cleanup candidate is a mount point')
 
 
-def package_cache(path):
-    return bool(set(str(path).replace('\\', '/').casefold().split('/')) &
-                {'.cache', '.npm', '.cargo', '.bun', 'node-compile-cache', 'npm-cache', 'pip-cache', 'uv-cache', 'go-build'})
+AGENT_CACHE_FILES = (
+    '/coldpass/sources/*.tgz',
+    '/coldpass/scans/*.json',
+    '/coldpass/github-repos/*/*/*.json',
+    '/t3-steer/*-nightly.*/t3',
+)
+
+
+REMOVING_NAME = re.compile(r'(?<=[/\\])\.([^/\\]+)\.coldcleaner-removing-[0-9a-f]{32}$')
+
+
+def package_cache(path, *, home=None):
+    path = REMOVING_NAME.sub(r'\1', str(path))
+    parts = path.replace('\\', '/').casefold().split('/')
+    if set(parts) & {'.npm', '.cargo', '.bun', 'node-compile-cache', 'npm-cache', 'pip-cache', 'uv-cache', 'go-build'}:
+        return True
+    if '.cache' not in parts:
+        return False
+    cache = PurePosixPath(home or Path.home()) / '.cache'
+    item = PurePosixPath(path)
+    if not cache.is_absolute() or not item.is_relative_to(cache):
+        return True
+    relative = item.relative_to(cache)
+    if parts.count('.cache') != 1:
+        return True
+    return not any((PurePosixPath('/') / relative).match(pattern) for pattern in AGENT_CACHE_FILES)
 
 
 def reject_package_caches(root):
@@ -994,7 +1123,85 @@ QUARANTINE_PREFIX = '.coldcleaner-quarantine-'
 QUARANTINE_STATE = '~/.config/coldcleaner/quarantine'
 
 
-def tree(path, hashes=False, approval=False, quarantined=False):
+def check_obsidian(vault):
+    home = Path.home()
+    roots = (home / '.t3' / 'worktrees', home / 'worktrees')
+    try:
+        for parent in (vault, *vault.parents):
+            if not any(parent != root and parent.is_relative_to(root) for root in roots):
+                break
+            marker = parent / '.git'
+            if marker.is_file() and not marker.is_symlink():
+                admin, common = git_dirs(parent)
+                if admin.parent == common / 'worktrees' and not configured_obsidian_vault(vault):
+                    return
+                break
+    except (OSError, ValueError, RuntimeError):
+        pass
+    raise ValueError('protected location: Obsidian vault ' + str(vault))
+
+
+def configured_obsidian_vault(vault):
+    home = Path.home()
+    if os.name == 'nt':
+        appdata = os.environ.get('APPDATA')
+        if not appdata:
+            return True
+        folders = [Path(appdata) / 'Obsidian']
+    elif sys.platform == 'darwin':
+        folders = [home / 'Library' / 'Application Support' / 'obsidian']
+    else:
+        folders = [home / '.config/obsidian',
+                   home / '.var/app/md.obsidian.Obsidian/config/obsidian',
+                   home / 'snap/obsidian/current/.config/obsidian']
+        xdg = os.environ.get('XDG_CONFIG_HOME', '')
+        if os.path.isabs(xdg):
+            folders.append(Path(xdg) / 'obsidian')
+    for folder in folders:
+        try:
+            config = json.loads((folder / 'obsidian.json').read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            continue
+        vaults = config.get('vaults', {}) if isinstance(config, dict) else None
+        if not isinstance(vaults, dict):
+            return True
+        for entry in vaults.values():
+            path = entry.get('path') if isinstance(entry, dict) else None
+            if not isinstance(path, str) or not os.path.isabs(path) or overlap(vault, path):
+                return True
+    return False
+
+
+def internal_link(item, root, original):
+    target = os.readlink(item)
+    raw = Path(target)
+    if raw.is_absolute():
+        try:
+            relative = raw.relative_to(original)
+        except ValueError:
+            raise ValueError('symlink escapes worktree: ' + str(item)) from None
+        back = os.path.relpath(root, item.parent)
+        target = str(Path(back) / relative)
+    destination = item.parent / target
+    resolved = destination.resolve()
+    if not (resolved.is_relative_to(root) or resolved.is_relative_to(original)) or not Path(os.path.abspath(destination)).is_relative_to(root):
+        raise ValueError('symlink escapes worktree: ' + str(item))
+    return target
+
+
+def source_paths(path):
+    result = git(path, 'ls-files', '--cached', '--others', '--exclude-standard', '-z', check=False)
+    result.check_returncode()
+    source = set()
+    for name in result.stdout.split('\0'):
+        if name:
+            entry = Path(name)
+            source.add(entry)
+            source.update(entry.parents)
+    return source
+
+
+def tree(path, hashes=False, approval=False, quarantined=False, agent_root=None, rebuild=False):
     present(path)
     path = Path(path)
     if not quarantined and any(part.casefold().startswith(QUARANTINE_PREFIX) for part in path.parts):
@@ -1004,16 +1211,22 @@ def tree(path, hashes=False, approval=False, quarantined=False):
     approval = approval and os.name == 'nt'
     if approval:
         require_ntfs(path)
-    reject_package_caches(path)
-    result = {}; security = {}; allocated = logical = files = 0; newest = path.lstat().st_mtime
-    entries = []
+    if rebuild and package_cache(path):
+        raise ValueError('package caches are excluded: ' + str(path))
+    if not rebuild:
+        reject_package_caches(path)
+    root = path.lstat()
+    result = {}; security = {}; allocated = logical = files = 0; newest = root.st_mtime
+    entries = [('', 0, root.st_dev, root.st_ino, 0)] if rebuild else []
+    content = []
     device = path.lstat().st_dev
-    pending = [path]
+    source = source_paths(path) if agent_root and hashes else set()
+    pending = [(path, False)]
     while pending:
-        item = pending.pop()
+        item, generated = pending.pop()
         if item.name.casefold().startswith(QUARANTINE_PREFIX):
             raise ValueError('contains local quarantine: ' + str(item))
-        if package_cache(item):
+        if not rebuild and package_cache(item):
             raise ValueError('package caches are excluded: ' + str(item))
         info = item.lstat()
         if info.st_dev != device:
@@ -1023,7 +1236,14 @@ def tree(path, hashes=False, approval=False, quarantined=False):
             raise ValueError('access metadata requires separate preservation: ' + str(item))
         if item.suffix.casefold() in ('.vhd', '.vhdx', '.qcow2', '.vmdk', '.vdi'):
             raise ValueError('VM disk requires hypervisor dependency proof: ' + str(item))
-        if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 1024:
+        link = None
+        if agent_root and item.name == '.git' and (item.parent != path or not stat.S_ISREG(info.st_mode)):
+            raise ValueError('nested repository or unsafe Git pointer: ' + str(item))
+        if agent_root and item != path and stat.S_ISLNK(info.st_mode):
+            link = internal_link(item, path, Path(agent_root))
+        elif rebuild and item != path and stat.S_ISLNK(info.st_mode):
+            link = internal_link(item, path, path)
+        elif stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 1024:
             raise ValueError('symlink or reparse point: ' + str(item))
         change = windows_file_safety(item, approval) if os.name == 'nt' else None
         if item.name == '.keep-local':
@@ -1033,31 +1253,51 @@ def tree(path, hashes=False, approval=False, quarantined=False):
         if item.name.casefold().endswith(MARKER):
             check_marker(item)
         if item.name.casefold() == '.obsidian':
-            raise ValueError('protected location: Obsidian vault ' + str(item.parent))
+            check_obsidian(item.parent)
         newest = max(newest, info.st_mtime)
         allocated += allocation(info)
         relative = str(item.relative_to(path.parent)).replace(os.sep, '/')
         entry = (relative, stat.S_IFMT(info.st_mode), info.st_size, info.st_mtime_ns, info.st_ctime_ns)
         entries.append((*entry, change, info.st_ino) if approval else entry)
-        if hashes:
+        if rebuild and item != path:
+            content.append((str(item.relative_to(path)), *entry[1:]))
+        directory = stat.S_ISDIR(info.st_mode)
+        generated = generated or (agent_root and item != path and directory and
+                                  (item.name.startswith('.venv') or item.name in
+                                   ('venv', 'node_modules', '__pycache__', 'target', 'dist', 'build', '.next',
+                                    '.pytest_cache', '.mypy_cache', '.ruff_cache')))
+        save = hashes and (not generated or item.relative_to(path) in source)
+        if save:
             security[relative] = (windows_security(item) if os.name == 'nt' else
                                   dict(mode=info.st_mode & 0o777, uid=info.st_uid,
                                        gid=info.st_gid, mtime_ns=info.st_mtime_ns))
         if '\\' in relative or any(ord(char) < 32 for char in relative):
             raise ValueError('unsupported archive member name: ' + repr(relative))
-        if item.is_dir():
-            pending.extend(item.iterdir())
-            if hashes:
+        if directory:
+            children = list(item.iterdir())
+            if agent_root:
+                names = {child.name.casefold() for child in children}
+                if 'head' in names and 'objects' in names:
+                    raise ValueError('possible bare repository inside agent worktree: ' + str(item))
+            pending.extend((child, generated) for child in children)
+            if save:
                 result[relative] = None
-        elif item.is_file():
-            logical += info.st_size; files += 1
-            if hashes:
-                with item.open('rb') as stream:
+        elif link is not None:
+            if save:
+                result[relative] = dict(link=link)
+        elif stat.S_ISREG(info.st_mode):
+            logical += info.st_size if not hashes or save else 0
+            files += 1
+            if save:
+                with os.fdopen(os.open(item, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)), 'rb') as stream:
                     result[relative] = sha256_hex(stream)
         else:
             raise ValueError('special file: ' + str(item))
     digest = hashlib.sha256(json.dumps(sorted(entries)).encode()).hexdigest()
-    return dict(bytes=allocated, logical_bytes=logical, files=files, newest=newest, manifest=result, security=security, digest=digest)
+    found = dict(bytes=allocated, logical_bytes=logical, files=files, newest=newest, manifest=result, security=security, digest=digest)
+    if rebuild:
+        found.update(identity=[root.st_dev, root.st_ino], content=hashlib.sha256(json.dumps(sorted(content)).encode()).hexdigest())
+    return found
 
 
 PERSONAL_FOLDERS = ('Documents', 'Desktop', 'Pictures', 'Library', 'iCloud Drive', 'iCloudDrive', 'Google Drive')
@@ -1138,6 +1378,8 @@ def check_lease(lease):
     if not os.path.lexists(lease):
         return
     try:
+        if not stat.S_ISREG(os.lstat(lease).st_mode):
+            raise ValueError(lease)
         text = Path(lease).read_text(encoding='utf-8').strip()
         if not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', text, re.ASCII):
             raise ValueError(text)
@@ -1308,7 +1550,8 @@ class ActivityPaths:
         return self.references[path]
 
 
-def guard(path, days=0, activity=None, protected=(), approval=False, activity_paths=None, broad=(), quarantined=False):
+def guard(path, days=0, activity=None, protected=(), approval=False, activity_paths=None, broad=(), quarantined=False, agent=False,
+          rebuild=None):
     path = Path(path)
     if not path.is_absolute() or '..' in path.parts or path in (Path(path.anchor), Path.home()):
         raise ValueError('invalid cleanup root')
@@ -1320,11 +1563,11 @@ def guard(path, days=0, activity=None, protected=(), approval=False, activity_pa
         if parent.is_symlink() or getattr(parent.lstat(), 'st_file_attributes', 0) & 1024 or (parent / '.keep-local').exists():
             raise ValueError('.keep-local or symlink ancestor: ' + str(parent))
         if (parent / '.obsidian').exists():
-            raise ValueError('protected location: Obsidian vault ' + str(parent))
+            check_obsidian(parent)
         if parent.is_dir():
             check_leases(parent, path.name + MARKER if parent == path.parent else '')
     if activity is None:
-        activity = workspaces(time.time() - days * 86400)
+        activity = workspaces(time.time() - days * 86400, cached=False)
         if activity['blocked']:
             raise ValueError('; '.join(activity['blocked']))
         activity['references'] = references()
@@ -1333,20 +1576,47 @@ def guard(path, days=0, activity=None, protected=(), approval=False, activity_pa
     normalized = path_key if sys.platform != 'darwin' else os.path.realpath(path)
     prefix = normalized.rstrip(os.sep) + os.sep
     broad = [expanded(item) for item in (*broad, str(Path.home()))]
+    held_keys = [path_key]
+    if rebuild:
+        checkout = Path(rebuild)
+        if checkout == path or not path.is_relative_to(checkout):
+            raise ValueError('rebuildable cache is outside its checkout')
+        checkout_idle(checkout, days)
+        held_keys.append(real_key(checkout))
     for name, reference, updated in activity['threads']:
         thread_key = activity_paths.thread_key(reference)
-        held = overlap_keys(path_key, thread_key)
-        if held and path_key != thread_key and contains_key(thread_key, path_key) and broad_folder(reference, thread_key, broad):
-            held = False
-        if (updated is None or updated > time.time() - days * 86400) and held:
-            raise ValueError(f'{name} thread uses {reference}')
+        for key in held_keys:
+            held = overlap_keys(key, thread_key)
+            if held and key != thread_key and contains_key(thread_key, key) and broad_folder(reference, thread_key, broad):
+                held = False
+            if (updated is None or updated > time.time() - days * 86400) and held:
+                raise ValueError(f'{name} thread uses {reference}')
+    holders = [(normalized, prefix)]
+    if rebuild:
+        whole = real_key(rebuild) if sys.platform != 'darwin' else os.path.realpath(rebuild)
+        holders.append((whole, whole.rstrip(os.sep) + os.sep))
     for reference in activity['references']:
         reference = activity_paths.reference_key(reference)
-        if reference.startswith(prefix) or reference == normalized:
+        if any(reference.startswith(start) or reference == exact for exact, start in holders):
             raise ValueError('running process uses ' + reference)
     options = {'approval': True} if approval and os.name == 'nt' else {}
     if quarantined:
         options['quarantined'] = True
+    if rebuild:
+        options['rebuild'] = True
+    if agent:
+        options['agent_root'] = path
+        admin, common = git_dirs(path)
+        if admin.parent != common / 'worktrees':
+            raise ValueError('agent cleanup needs a registered linked worktree')
+        cutoff = time.time() - days * 86400
+        event = git(path, 'reflog', 'show', '-1', '--date=unix', '--format=%gD', 'HEAD')
+        latest = re.fullmatch(r'HEAD@\{(\d+)\}', event)
+        if event and not latest:
+            raise ValueError('unreadable Git activity timestamp')
+        if ((latest and int(latest[1]) > cutoff)
+                or any(item.exists() and item.stat().st_mtime > cutoff for item in (admin / 'HEAD', admin / 'index'))):
+            raise ValueError('recent Git activity within %s days' % days)
     info = tree(path, **options)
     if info['newest'] > time.time() - days * 86400:
         raise ValueError('recent activity within %s days' % days)
@@ -1449,7 +1719,7 @@ def repo_state(path, listing, abandoned=False):
         containing = set(git(path, 'for-each-ref', '--format=%(objectname)', '--contains', head).splitlines())
         published = bool(containing & published_refs)
     merged = False
-    main = refs.get('refs/heads/main') or refs.get('refs/heads/master')
+    main = default_branch(refs)
     if main and head and git(path, 'cat-file', '-e', main + '^{commit}', check=False).returncode == 0:
         merged = git(path, 'merge-base', '--is-ancestor', head, main, check=False).returncode == 0
         published = published or merged
@@ -1467,10 +1737,14 @@ def repo_state(path, listing, abandoned=False):
               and os.path.realpath(line[9:]) != os.path.realpath(path)]
     worktree = (Path(path) / '.git').is_file()
     linked_worktree = worktree and admin.resolve() != common.resolve()
-    shared_stash = bool(git(path, 'stash', 'list'))
+    stash_heads = git(path, 'stash', 'list', '--format=%H').splitlines()
+    shared_stash = bool(stash_heads)
+    agent_worktree = linked_worktree and os.name == 'posix' and agent_path(path)
+    if agent_worktree and abandoned:
+        reflog = sorted(set(reflog).union(stash_heads) - {head})
     stashes = not linked_worktree and shared_stash
     return dict(path=str(path), head=head, branch=branch, dirty=dirty, index_only=index_only, ignored=ignored,
-                stashes=stashes, shared_stash=shared_stash, published=published, merged=merged, reflog=reflog,
+                stashes=stashes, shared_stash=shared_stash, agent_worktree=agent_worktree, published=published, merged=merged, reflog=reflog,
                 linked_worktrees=linked,
                 worktree=worktree, common=str(common),
                 remote=git(path, 'remote', 'get-url', 'origin', check=False).stdout.strip())
@@ -1484,7 +1758,53 @@ def in_progress(admin):
     return any((admin / name).exists() for name in GIT_OPERATIONS)
 
 
-def remove_abandoned(source, common, verify, archived, unchanged):
+def discard_rollback(path):
+    try:
+        delete(path)
+    except PermissionError:
+        for folder, _, _ in os.walk(path):
+            os.chmod(folder, 0o700)
+        delete(path)
+
+
+def rollback_copy(folder, parent, stack):
+    import shutil
+    import tempfile
+    scratch = Path(tempfile.mkdtemp(dir=parent, prefix='.coldcleaner-rollback-'))
+    stack.callback(discard_rollback, scratch)
+    shutil.copytree(folder, scratch / 'original', symlinks=True, copy_function=os.link)
+    return scratch
+
+
+def remove_agent_worktree(common, pairs, cleanup, rollback, remove_branch):
+    (quarantine, work_copy), (retired, admin_copy) = pairs
+    registry_mode = stat.S_IMODE(retired.parent.stat().st_mode)
+    try:
+        for pointer, target, scratch in ((quarantine / '.git', 'gitdir: ' + str(retired), work_copy),
+                                         (retired / 'gitdir', str(quarantine / '.git'), admin_copy)):
+            replacement = scratch / 'pointer'
+            replacement.write_text(target + '\n')
+            os.replace(replacement, pointer)
+        git(common, 'worktree', 'remove', '--force', '--force', '--', str(quarantine))
+        remove_branch()
+    except BaseException:
+        try:
+            if not retired.parent.exists():
+                retired.parent.mkdir(mode=registry_mode)
+                retired.parent.chmod(registry_mode)
+            for folder, scratch in pairs:
+                if folder.exists():
+                    os.rename(folder, scratch / 'partial')
+                os.rename(scratch / 'original', folder)
+        except OSError as exc:
+            cleanup.pop_all()
+            rollback.pop_all()
+            remaining = [scratch / 'original' if (scratch / 'original').exists() else folder for folder, scratch in pairs]
+            raise RuntimeError(f'worktree rollback incomplete; recovery paths: {remaining[0]}, {remaining[1]}: {exc}') from exc
+        raise
+
+
+def remove_abandoned(source, common, verify, archived, unchanged, agent, remove_branch):
     import uuid
     admin = Path(git(source, 'rev-parse', '--path-format=absolute', '--git-dir'))
     binding = check_admin(source, common, admin)
@@ -1496,34 +1816,38 @@ def remove_abandoned(source, common, verify, archived, unchanged):
         raise ValueError('worktree is locked') from None
     quarantine = source.with_name('.' + source.name + '.coldcleaner-removing-' + uuid.uuid4().hex)
     retired = admin.with_name('.' + admin.name + '.coldcleaner-removing-' + uuid.uuid4().hex)
-    try:
+    def unlock():
+        lock = admin / 'locked'
+        if lock.is_file() and lock.read_text() == token:
+            lock.unlink()
+
+    with ExitStack() as scratch, ExitStack() as rollback:
+        rollback.callback(unlock)
         os.rename(source, quarantine)
-        moved = False
-        try:
-            check_unused(source, quarantine)
-            snapshot = fingerprint(admin)
-            unchanged(quarantine)
-            verify(quarantine)
-            archived()
-            check_holds_above(source)
-            if check_admin(source, common, admin, token) != binding:
-                raise ValueError('worktree admin folder changed before removal')
-            os.rename(admin, retired)
-            moved = True
-            check_unused(source, quarantine, admin, retired)
-            if fingerprint(retired) != snapshot:
-                raise ValueError('Git proof changed before removal')
-        except Exception:
-            if moved:
-                os.rename(retired, admin)
-            os.rename(quarantine, source)
-            raise
-    except Exception:
-        if (admin / 'locked').is_file() and (admin / 'locked').read_text() == token:
-            (admin / 'locked').unlink()
-        raise
-    delete(quarantine)
-    delete(retired)
+        rollback.callback(os.rename, quarantine, source)
+        check_unused(source, quarantine)
+        snapshot = fingerprint(admin)
+        if agent:
+            work_copy = rollback_copy(quarantine, source.parent, scratch)
+            admin_copy = rollback_copy(admin, common, scratch)
+        unchanged(quarantine)
+        verify(quarantine)
+        archived()
+        check_holds_above(source)
+        if check_admin(source, common, admin, token) != binding:
+            raise ValueError('worktree admin folder changed before removal')
+        os.rename(admin, retired)
+        rollback.callback(os.rename, retired, admin)
+        check_unused(source, quarantine, admin, retired)
+        if fingerprint(retired) != snapshot:
+            raise ValueError('Git proof changed before removal')
+        if agent:
+            pairs = ((quarantine, work_copy), (retired, admin_copy))
+            remove_agent_worktree(common, pairs, scratch, rollback, remove_branch)
+        rollback.pop_all()
+    if not agent:
+        delete(quarantine)
+        delete(retired)
 
 
 def fingerprint(folder):
@@ -1594,6 +1918,165 @@ def discover(roots):
     paths = sorted(p for p in found if (Path(p) / '.git').is_file())
     clones = sorted(p for p in found if (Path(p) / '.git').is_dir())
     return dict(paths=paths, clones=clones, roots=found, errors=errors, notes=notes)
+
+
+def checkout_idle(checkout, days):
+    admin, _ = git_dirs(checkout)
+    cutoff = time.time() - days * 86400
+    for item in (admin / 'HEAD', admin / 'index', admin / 'logs' / 'HEAD'):
+        if item.exists() and item.stat().st_mtime > cutoff:
+            raise ValueError('recent Git activity in checkout within %s days' % days)
+
+
+def regular_file(path):
+    return path.is_file() and not path.is_symlink()
+
+
+def rebuild_proof(folder, checkout):
+    required, choices, upward = REBUILDABLE[folder.name]
+    if not all(regular_file(folder.parent / name) for name in required):
+        return None
+    places = [folder.parent, *(parent for parent in folder.parent.parents if parent.is_relative_to(checkout))] if upward else [folder.parent]
+    found = next((place / name for place in places for name in choices if regular_file(place / name)), None)
+    if choices and found is None:
+        return None
+    return [str(folder.parent / name) for name in required] + ([str(found)] if found else [])
+
+
+def package_dir(item):
+    return item.is_dir() and regular_file(item / 'package.json')
+
+
+def walk(folder):
+    for base, dirs, files in os.walk(folder):
+        relative = PurePosixPath(Path(base).relative_to(folder).as_posix())
+        for name in dirs:
+            yield relative / name, not os.path.islink(os.path.join(base, name))
+        for name in files:
+            yield relative / name, False
+
+
+def venv_lib(item):
+    if item.name == 'Lib':
+        return all(child.name == 'site-packages' and child.is_dir() for child in item.iterdir())
+    return all(re.fullmatch(r'python[0-9]+(\.[0-9]+)*t?', child.name) and child.is_dir()
+               and all(inner.name in PYTHON_LIB_ENTRIES and inner.is_dir() for inner in child.iterdir())
+               for child in item.iterdir())
+
+
+def mypy_entry(folder, path, directory):
+    top = path.parts[0]
+    if len(path.parts) == 1 and top in MYPY_ENTRIES:
+        return not directory
+    if not version_name(top):
+        return False
+    if directory or path.name.endswith(MYPY_SUFFIXES):
+        return True
+    if len(path.parts) != 2:
+        return False
+    if path.name == 'cache.db':
+        return sqlite_file(folder / path)
+    return path.name in MYPY_SQLITE_SIDECARS
+
+
+def sqlite_file(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+    except OSError:
+        return False
+    try:
+        return stat.S_ISREG(os.fstat(fd).st_mode) and os.read(fd, 16) == b'SQLite format 3\x00'
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def ruff_entry(path, directory):
+    if len(path.parts) == 1:
+        return path.name in ('CACHEDIR.TAG', '.gitignore') and not directory or version_name(path.name) and directory
+    return len(path.parts) == 2 and version_name(path.parts[0]) and not directory and re.fullmatch('[0-9a-f]+', path.name)
+
+
+def version_name(name):
+    return re.fullmatch(r'[0-9]+(\.[0-9]+)*', name) is not None
+
+
+def tool_made(folder):
+    names = {item.name: item for item in folder.iterdir()}
+    kind = folder.name
+    if kind == 'target':
+        return bool({'CACHEDIR.TAG', '.rustc_info.json'} & set(names)) and all(
+            name in CARGO_ENTRIES or (re.fullmatch('flycheck[0-9]+', name) and item.is_dir())
+            or (item.is_dir() and any((item / build).is_dir() for build in ('debug', 'release'))) for name, item in names.items())
+    if kind == 'node_modules':
+        return bool(set(NODE_MARKERS) & set(names)) and all(
+            name in NODE_HIDDEN or package_dir(item)
+            or (name.startswith('@') and item.is_dir() and all(package_dir(child) for child in item.iterdir()))
+            for name, item in names.items())
+    if kind in ('.venv', 'venv'):
+        return (regular_file(folder / 'pyvenv.cfg') and set(names) <= VENV_ENTRIES
+                and all(venv_lib(names[name]) for name in ('lib', 'lib64', 'Lib') if name in names))
+    if not regular_file(folder / 'CACHEDIR.TAG'):
+        return False
+    if kind == '.pytest_cache':
+        return all((str(path), directory) in PYTEST_ENTRIES for path, directory in walk(folder))
+    if kind == '.mypy_cache':
+        return all(mypy_entry(folder, path, directory) for path, directory in walk(folder))
+    return all(ruff_entry(path, directory) for path, directory in walk(folder))
+
+
+def rebuildable(checkout):
+    checkout = Path(checkout)
+    listed = git(checkout, 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory')
+    found = []
+    for name in listed.split('\0'):
+        folder = checkout / name.rstrip('/')
+        if (not name.endswith('/') or folder.name not in REBUILDABLE or package_cache(folder)
+                or any(item.is_symlink() for item in (folder, *folder.parents) if item.is_relative_to(checkout))
+                or not folder.is_dir() or git(checkout, 'ls-files', '-z', '--', name) or not tool_made(folder)):
+            continue
+        proof = rebuild_proof(folder, checkout)
+        if proof:
+            found.append(dict(path=str(folder), proof=proof))
+    return found
+
+
+def remove_rebuildable(path, request):
+    import shutil
+    import uuid
+    locally_allowed(path, True)
+    if not any(item['path'] == path for item in rebuildable(request['checkout'])):
+        raise ValueError('rebuildable proof changed before removal')
+    if not getattr(shutil.rmtree, 'avoids_symlink_attacks', False):
+        raise ValueError('symlink-safe delete is unavailable on this host')
+    current = guard(path, request['days'], protected=request.get('protected', ()), broad=request.get('broad', ()),
+                    rebuild=request['checkout'])
+    if current['digest'] != request['digest']:
+        raise ValueError(APPROVAL_STALE)
+    source = Path(path)
+    removing = source.with_name('.' + source.name + '.coldcleaner-removing-' + uuid.uuid4().hex)
+    os.rename(source, removing)
+    try:
+        moved = tree(removing, rebuild=True)
+        if moved['identity'] != current['identity'] or moved['content'] != current['content']:
+            raise ValueError(APPROVAL_STALE)
+        check_unused(request['checkout'])
+    except Exception:
+        try:
+            os.rename(removing, source)
+        except OSError:
+            pass
+        raise
+    delete(removing)
+    return dict(removed=path, bytes=current['bytes'])
+
+
+def default_branch(refs):
+    if 'HEAD' in refs:
+        return refs['HEAD']
+    found = [refs[name] for name in ('refs/heads/main', 'refs/heads/master') if name in refs]
+    return found[0] if len(found) == 1 else None
 
 
 def unpublished(path, commits, published):
@@ -1851,12 +2334,14 @@ def run_operation(request):
     if op == 'expand':
         import glob
         found = {}
+        containers = {match for pattern in request.get('containers', []) for match in glob.glob(expanded(pattern))}
         for pattern in request['patterns']:
             for match in glob.glob(expanded(pattern)):
-                if pattern in request.get('children', []):
+                if pattern in request.get('children', []) or pattern in request.get('containers', []):
                     if Path(match).is_symlink() or not Path(match).is_dir():
                         continue
-                    candidates = [str(child) for child in Path(match).iterdir()]
+                    candidates = [str(child) for child in Path(match).iterdir()
+                                  if pattern in request.get('children', []) or not child.name.startswith('.')]
                 else:
                     candidates = [match]
                 for p in candidates:
@@ -1868,7 +2353,8 @@ def run_operation(request):
                                                      for pattern in found[q]])) for p in found}
         exclude = request.get('exclude', {})
         return {p: patterns for p, patterns in sorted(related.items())
-                if not excluded(p, [item for pattern in patterns for item in exclude.get(pattern, [])])}
+                if p not in containers
+                and not excluded(p, [item for pattern in patterns for item in exclude.get(pattern, [])])}
     if op == 'repo':
         return repo(path, request.get('listing', ''), request.get('stub_ok', False), request.get('abandoned', False))
     if op == 'clone':
@@ -1892,16 +2378,26 @@ def run_operation(request):
         return unlisted(request['roots'], request['covered'], request['skip'], request['seconds'], request.get('state'), request.get('save', False))
     if op == 'sizes':
         deadline = time.monotonic() + request['seconds']
+        if request.get('parallel'):
+            candidates = [(item,) for item in request['paths']]
+            sizes = (du_sizes(candidates, deadline, ()) if du_available()
+                     else python_sizes(candidates, deadline, ()))
+            return [sizes.get(item, dict(bytes=0, complete=False)) for item in candidates]
         return [measure(item, deadline) for item in request['paths']]
     if op == 'allowed':
         return locally_allowed(path, request['worktree'])
     if op == 'guard':
         return guard(path, request.get('days', 0), request.get('activity'), request.get('protected', ()), request.get('approval', False),
-                     broad=request.get('broad', ()))
+                     broad=request.get('broad', ()), agent=request.get('agent', False), rebuild=request.get('rebuild'))
+    if op == 'rebuildable':
+        return rebuildable(path)
+    if op == 'rebuild-remove':
+        return remove_rebuildable(path, request)
     if op == 'activity':
         return dict(**workspaces(), references=references())
     if op == 'manifest':
-        return tree(path, True)
+        options = dict(agent_root=path) if request.get('agent') else {}
+        return tree(path, True, **options)
     if op == 'bundle':
         import shutil
         import tempfile
@@ -1950,6 +2446,9 @@ def run_operation(request):
         return dict(restored_git=path)
     if op == 'tar':
         path = extended(path)
+        if 'members' in request:
+            write_agent_tar(path, request['members'], sys.stdout.buffer)
+            return None
         with tarfile.open(fileobj=sys.stdout.buffer, mode='w|', dereference=True) as archive:
             archive.add(path, arcname=Path(path).name)
         return None
@@ -1999,15 +2498,26 @@ def run_operation(request):
         with tempfile.TemporaryDirectory(dir=target.parent, prefix='.coldcleaner-restore-') as staging:
             found = set()
             metadata = []
+            links = []
             with tarfile.open(fileobj=sys.stdin.buffer, mode='r|') as archive:
                 for item in archive:
                     name = item.name.rstrip('/')
                     member_path = PurePosixPath(name)
                     if member_path.is_absolute() or '..' in member_path.parts or '\\' in name or member_path.parts[:1] != (root,):
                         raise ValueError('unsafe archive path')
-                    if name not in expected or name in found or not (item.isdir() or item.isfile()):
+                    if (str(member_path) != name or root in ('.', '..') or name not in expected or name in found
+                            or not (item.isdir() or item.isfile() or item.issym())):
                         raise ValueError('unexpected archive member')
                     found.add(name)
+                    if item.issym():
+                        if (os.name == 'nt' or name == root or os.path.isabs(item.linkname)
+                                or expected[name] != dict(link=item.linkname)):
+                            raise ValueError('unsafe archive link')
+                        if name in wanted:
+                            links.append((Path(staging).joinpath(*member_path.parts), item.linkname))
+                        continue
+                    if item.isdir() != (expected[name] is None):
+                        raise ValueError('archive member type differs from manifest')
                     if name not in wanted:
                         continue
                     metadata.append(item)
@@ -2026,6 +2536,12 @@ def run_operation(request):
             if found != set(expected) or not set(wanted) <= found:
                 raise ValueError('incomplete archive')
             source = Path(staging) / root
+            for destination, link in links:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+            for destination, link in links:
+                destination.symlink_to(link)
+            for destination, _ in links:
+                internal_link(destination, source, source)
             for item in reversed(metadata):
                 destination = Path(staging).joinpath(*PurePosixPath(item.name.rstrip('/')).parts)
                 os.chmod(destination, item.mode & 0o777)
@@ -2044,8 +2560,12 @@ def run_operation(request):
         return dict(restored=str(target))
     if op == 'remove':
         locally_allowed(path, bool(request.get('head')) or request.get('clone', False))
+        agent = request.get('agent', False)
+        if agent and (not request.get('head') or request.get('manifest') is None or not request.get('keep')
+                      or request.get('days', 0) < AGENT_WORKTREE_IDLE_DAYS):
+            raise ValueError('agent worktree requires three idle days and verified local NAS copy')
         current = guard(path, request.get('days', 0), protected=request.get('protected', ()), approval=request.get('digest') is not None,
-                        broad=request.get('broad', ()))
+                        broad=request.get('broad', ()), agent=agent)
         if request.get('digest') is not None and current['digest'] != request['digest']:
             raise ValueError(APPROVAL_STALE)
         if excluded(path, request.get('exclude', ())):
@@ -2053,7 +2573,10 @@ def run_operation(request):
         def verify(source):
             if request.get('manifest') is None and request.get('security') is None:
                 return
-            current = tree(source, True, quarantined=True) if request.get('quarantine') else tree(source, True)
+            options = dict(agent_root=path) if agent else {}
+            if request.get('quarantine'):
+                options['quarantined'] = True
+            current = tree(source, True, **options)
             for key, reason in (('manifest', 'source changed after verified NAS copy'),
                                 ('security', 'source security changed after verified NAS copy')):
                 actual = {Path(path).name + name[len(source.name):]: value for name, value in current[key].items()}
@@ -2064,16 +2587,28 @@ def run_operation(request):
             if keep and (not os.path.isfile(keep['file']) or os.path.getsize(keep['file']) != keep['bytes']
                          or keep.get('mount') and not os.path.ismount(keep['mount'])):
                 raise ValueError('verified archive is no longer present')
+            if agent:
+                archive = Path(keep['file'])
+                receipt = json.loads(archive.with_suffix('.sha256.json').read_bytes())
+                recovery = receipt['git']
+                if (receipt['source'] != path or receipt['manifest'] != request['manifest']
+                        or receipt['security'] != request['security'] or recovery['head'] != request['head']
+                        or recovery['reflog'] != request['reflog']):
+                    raise ValueError('verified archive receipt changed before removal')
+                with (archive.parent / 'head.bundle').open('rb') as stream:
+                    if sha256_hex(stream) != recovery['sha256']:
+                        raise ValueError('NAS Git recovery bundle SHA-256 mismatch')
         branch_removed = False
         recovery = {}
         abandoned = request.get('abandoned', False)
         if abandoned and (request.get('digest') is None or request.get('manifest') is None):
             raise ValueError('abandoned work needs an approved item and a verified NAS copy')
         if request.get('head'):
-            state = repo(path, request['listing'], abandoned=abandoned)
+            state = repo(path, request['listing'], abandoned=abandoned or agent)
             if (state['head'] != request['head'] or state['branch'] != request['branch']
                     or state['remote'] != request['remote'] or state['stashes']
-                    or abandoned and (state['index_only'] or state['shared_stash'])
+                    or agent and (not state['agent_worktree'] or state['index_only'])
+                    or abandoned and (state['index_only'] or state['shared_stash'] and not agent)
                     or not abandoned and (state['dirty'] or not state['published'])
                     or state['ignored'] and request.get('manifest') is None
                     or state['reflog'] and (request.get('manifest') is None
@@ -2086,21 +2621,26 @@ def run_operation(request):
             keep_branch = abandoned or branches.count('branch refs/heads/' + branch) > 1
             def unchanged(source):
                 current = repo(source, request['listing'], abandoned=True)
-                if (current['head'] != state['head'] or current['branch'] != state['branch'] or current['shared_stash']
+                if (current['head'] != state['head'] or current['branch'] != state['branch']
+                        or current['remote'] != state['remote'] or current['dirty'] and not abandoned
+                        or current['shared_stash'] and not agent
                         or current['index_only'] or not set(current['reflog']) <= set(request.get('reflog') or ())):
                     raise ValueError('Git proof changed before removal')
-            if abandoned:
-                remove_abandoned(Path(path), Path(state['common']), verify, archived, unchanged)
+            def remove_branch():
+                nonlocal branch_removed
+                if branch and not keep_branch:
+                    subprocess.run(['git', '--git-dir', state['common'], 'update-ref', '-d',
+                                    'refs/heads/' + branch, state['head']], check=True, capture_output=True)
+                    branch_removed = True
+            if abandoned or agent:
+                remove_abandoned(Path(path), Path(state['common']), verify, archived, unchanged, agent, remove_branch)
             else:
                 archived()
                 tree(Path(path))
                 check_holds_above(Path(path))
                 check_git_locks(*git_dirs(path))
                 git(state['common'], 'worktree', 'remove', '--', path)
-            if branch and not keep_branch:
-                subprocess.run(['git', '--git-dir', state['common'], 'update-ref', '-d',
-                                'refs/heads/' + branch, state['head']], check=True, capture_output=True)
-                branch_removed = True
+                remove_branch()
         else:
             import uuid
             source = Path(path)

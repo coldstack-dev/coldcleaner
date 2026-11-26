@@ -57,12 +57,13 @@ class HostReport:
 
 
 CATEGORIES = {'worktree': 'Completed worktrees', 'clone': 'Redundant clones', 'scratch': 'Scratch and temp',
-              'test-output': 'Test and benchmark outputs', 'artifact': 'Archived agent artifacts'}
+              'test-output': 'Test and benchmark outputs', 'artifact': 'Archived agent artifacts',
+              'rebuild': 'Rebuildable caches'}
 
 
 def category(row):
     tier = row['tier']
-    if tier in ('worktree', 'clone'):
+    if tier in ('worktree', 'clone', 'rebuild'):
         return tier
     if tier == 'archive':
         return row.get('category')
@@ -76,6 +77,8 @@ def categories(reports):
             totals[key]['items'] += 1
             totals[key]['reclaimable_bytes'] += row['bytes']
             totals[key]['acted_bytes'] += row['bytes'] if acted(row) else 0
+    if not totals['rebuild']['items']:
+        del totals['rebuild']
     return totals
 
 
@@ -160,8 +163,12 @@ def remaining(rows, removed):
         yield row, max(0, row['bytes'] - freed)
 
 
+def coverage_note(note):
+    return 'skip sizes' in note or note.startswith('Unreadable, skipped')
+
+
 def managed_partial(entry):
-    return incomplete(entry) or any('skip sizes' in note or note.startswith('Unreadable, skipped') for note in entry.notes)
+    return incomplete(entry) or any(map(coverage_note, entry.notes))
 
 
 def managed(report):

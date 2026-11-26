@@ -12,7 +12,7 @@ Coldcleaner removes finished Git worktrees published on GitHub and archives list
 > - Git work that is not on GitHub: uncommitted files, stashes, unpushed commits and open pull requests.
 > - Anything changed recently: 4 days for archived folders, 7 days for worktrees (1 day once merged).
 > - GitHub itself (no force-push, no new repositories), virtual machines, containers and Docker volumes.
-> - Package caches. They are out of scope, and an `archive` path that holds a well-known cache folder (`.cache`, `.npm`, `.cargo`, `.bun`, `npm-cache`, `pip-cache`, `uv-cache`, `go-build`, `node-compile-cache`) is skipped. Keep other caches out of `archive`.
+> - Package caches. The archive tier skips well-known cache folders (`.cache`, `.npm`, `.cargo`, `.bun`, `npm-cache`, `pip-cache`, `uv-cache`, `go-build`, `node-compile-cache`) and the trees that contain them. Only explicitly supported agent cache files can be archived from inside `~/.cache`.
 >
 > By default nothing is changed at all. It only deletes when you pass `--apply` **and** list that kind of cleanup in `live` in your rules file. The example rules list nothing.
 
@@ -33,14 +33,14 @@ Other ways to install (pipx, pip in a virtual environment, or running from the c
 ## Quick start (one machine)
 
 ```sh
-uv tool install git+https://github.com/TayHCode/coldcleaner@v0.3.3
+uv tool install git+https://github.com/TayHCode/coldcleaner@v0.3.2
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner"
-[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml" ] || { curl -fsSL https://raw.githubusercontent.com/TayHCode/coldcleaner/v0.3.3/rules.example.toml -o "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" && mv "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml"; }
+[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml" ] || { curl -fsSL https://raw.githubusercontent.com/TayHCode/coldcleaner/v0.3.2/rules.example.toml -o "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" && mv "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml"; }
 coldcleaner doctor
 coldcleaner reclaim --host local
 ```
 
-1. `uv tool install` adds the v0.3.3 command to `~/.local/bin`. To install from a clone, run `uv tool install .`.
+1. `uv tool install` adds the v0.3.2 command to `~/.local/bin`. To install from a clone, run `uv tool install .`.
 2. Download the example to `~/.config/coldcleaner/rules.toml` or `$XDG_CONFIG_HOME/coldcleaner/rules.toml`. An existing file is kept.
 3. `doctor` reports PASS or FAIL for each prerequisite. Add `--json` for structured check results. Exit 1 means a check failed. You can still dry-run.
 4. `reclaim --host local` writes a dry-run report with proposed actions and skip reasons. It prints the report path, disk use and estimated savings.

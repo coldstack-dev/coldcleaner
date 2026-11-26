@@ -102,7 +102,7 @@ def run(config, chosen_hosts, apply=False, *, as_json=False, deadline=None, skip
                 later = len(chosen_hosts) - index - 1 + len(skipped)
                 now = time.monotonic()
                 cleaner.deadline = max(deadline - reclaim.HOST_RESERVE_SECONDS * later, now + (deadline - now) / (later + 1))
-                for tier in ('worktrees', 'clones', 'archives', 'unlisted'):
+                for tier in ('worktrees', 'clones', *(('rebuilds',) if 'rebuild' in config['live'] else ()), 'archives', 'unlisted'):
                     if time.monotonic() >= cleaner.deadline:
                         entry.errors.append(f'{tier} not started: {reclaim.DEADLINE}')
                         failed = True
@@ -252,11 +252,12 @@ def parser():
         'restore-drill': 'Restore one random archive into a scratch folder on this machine, check it against its file list and SHA-256s, '
                          'delete the copy and log pass or fail. Exit 1 on fail.',
         'approve': 'Approve items from a reclaim dry-run plan so reclaim --apply may act on them.',
+        'triage': 'Summarize held worktrees by reason, repo and age, and optionally approve old abandoned ones for a verified archive copy.',
     }
     for name, description in descriptions.items():
         command = commands.add_parser(name, help=description, description=description)
         command.add_argument('--rules', type=Path, default=rules.DEFAULT_PATH, help='Read configuration from this rules file.')
-        if name in ('reclaim', 'status', 'doctor', 'top'):
+        if name in ('reclaim', 'status', 'doctor', 'top', 'triage'):
             command.add_argument('--host', help='Select one host instead of all hosts.')
         if name in ('reclaim', 'doctor', 'top'):
             command.add_argument('--local', action='store_true', help='Run --host on this machine without ssh (its own nightly).')
@@ -267,6 +268,8 @@ def parser():
                                  'Exit 0 on success, 1 for findings or refusal, or 2 for usage or runtime errors.')
         if name == 'reclaim':
             command.add_argument('--apply', action='store_true', help='Perform actions enabled by the rules instead of a dry run.')
+            command.add_argument('--no-gh', action='store_true',
+                                 help='Skip GitHub pull request checks; only heads merged into the published default branch qualify.')
             command.add_argument('--i-reviewed', type=Path, metavar='REPORT',
                                  help='Require this complete dry-run report to cover the selected hosts and current rules.')
         if name == 'top':
@@ -276,7 +279,13 @@ def parser():
         if name == 'approve':
             command.add_argument('plan', type=Path, help='The .plan.json file written next to a reclaim dry-run report.')
             command.add_argument('ids', nargs='+', metavar='ID', help='Item IDs from the plan, or all.')
-        if name in ('reclaim', 'status', 'doctor', 'metrics', 'restore-drill', 'approve', 'top'):
+        if name == 'triage':
+            command.add_argument('--archive-older-than', type=positive, metavar='DAYS',
+                                 help='Select abandoned worktrees held at least DAYS from the current-rules dry-run plans.')
+            mode = command.add_mutually_exclusive_group()
+            mode.add_argument('--dry-run', action='store_true', help='List the selection without approving it (default).')
+            mode.add_argument('--apply', action='store_true', help='Approve the selection so the next reclaim --apply archives it.')
+        if name in ('reclaim', 'status', 'doctor', 'metrics', 'restore-drill', 'approve', 'top', 'triage'):
             command.add_argument('--report-dir', type=Path, help='Use this directory for cleanup reports.')
         if name == 'find':
             command.add_argument('term', help='Search archive records and file paths for this text.')
@@ -402,8 +411,8 @@ def main(argv=None):
                           code=2 if args.command in STANDARD_JSON_COMMANDS else 1)
     if getattr(args, 'to_host', None) and hosts.HOSTS[args.to_host].kind != 'posix':
         return refuse(args, 'coldcleaner: --to-host requires a POSIX host')
-    if args.command == 'reclaim' and args.apply and not {'worktree', 'clone', 'archive'} & set(config['live']):
-        return refuse(args, 'coldcleaner: reclaim --apply refused: none of worktree, clone or archive is listed in live')
+    if args.command == 'reclaim' and args.apply and not {'worktree', 'clone', 'archive', 'rebuild'} & set(config['live']):
+        return refuse(args, 'coldcleaner: reclaim --apply refused: none of worktree, clone, archive or rebuild is listed in live')
     if args.command == 'reclaim' and args.apply and config.get('archive_before_delete', 'on') != 'off':
         if os.name == 'nt':
             try:
@@ -445,6 +454,21 @@ def main(argv=None):
             record_human_action(config, args.command, len(chosen))
             print(f"approved {len(chosen)} items in {Path(config['report_dir']) / reclaim.APPROVALS}: {', '.join(chosen) or 'none'}")
             return 0
+        if args.command == 'triage':
+            from . import triage
+            if args.apply and args.archive_older_than is None:
+                raise ValueError('triage --apply needs --archive-older-than DAYS')
+            items = triage.held(config, {host.name for host in selected})
+            lines = triage.summary(items)
+            if found := triage.rebuildable(config, {host.name for host in selected}):
+                lines += ['', *found]
+            if args.archive_older_than is not None:
+                found, approved = triage.archive(config, triage.abandoned(config, items, args.archive_older_than), args.apply)
+                lines += ['', *found]
+                if approved:
+                    record_human_action(config, 'approve', approved)
+            print('\n'.join(lines))
+            return 0
         if args.command == 'top':
             from . import top
             if not args.host:
@@ -459,6 +483,7 @@ def main(argv=None):
             print('\n'.join(metrics.render(metrics.compute(config['report_dir'], config.get('nas_root'), args.days), args.days)))
             return 0
         if args.command == 'reclaim':
+            config['no_gh'] = args.no_gh
             collection = {'collect_reports': True} if args.apply and not args.host and config.get('collect_hosts') else {}
             if args.apply and args.i_reviewed is not None:
                 covered = report.dry_run_hosts(args.i_reviewed, config.get('rules_sha256'), strict=True)

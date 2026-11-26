@@ -10,6 +10,55 @@ from coldcleaner import fleet, reclaim, report, rules
 
 
 class TopTests(unittest.TestCase):
+    def test_partial_scan_prints_warning_before_ranked_clutter(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / 'rules.toml'
+            config.write_text(
+                f'alert_pct = 80\nworktree_idle_days = 7\narchive_idle_days = 4\n'
+                f'nas_root = {json.dumps(str(root / "nas"))}\nreport_dir = {json.dumps(str(root))}\n'
+                'live = ["archive"]\nalready_compressed_extensions = []\n[hosts.example]\nkind = "posix"\n'
+            )
+            sha = rules.load(config)['rules_sha256']
+            (root / 'fleet').mkdir()
+            entry = report.HostReport('example', notes=['Unreadable, skipped: /srv/restricted: Permission denied'])
+            entry.actions = [
+                dict(tier='archive', action='would remove', path='/srv/small', bytes=10, reason='', category='scratch'),
+                dict(tier='archive', action='would remove', path='/srv/large', bytes=40, reason='', category='scratch'),
+            ]
+            scanned = '2026-01-01T00:00:00+00:00'
+            fleet.snapshot(root, [entry], None, sha, {'example': scanned})
+            snapshot = root / 'fleet' / 'waiting.json'
+            report_path = root / '2026-01-01-003000-000000-00000000000000000000000000000000.md'
+            command = [sys.executable, '-B', '-m', 'coldcleaner', 'top', '--rules', str(config), '--host', 'example']
+            for legacy in (False, True):
+                with self.subTest(legacy_snapshot=legacy):
+                    if legacy:
+                        state = json.loads(snapshot.read_text())
+                        state['example'].pop('coverage_details', None)
+                        snapshot.write_text(json.dumps(state))
+                        report_path.write_text(report.render([entry], rules_sha256=sha, reclaim=True))
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=3)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    lines = result.stdout.splitlines()
+                    self.assertEqual(lines[:2], [
+                        'WARNING: example scan coverage is partial.',
+                        '  Unreadable, skipped: /srv/restricted: Permission denied',
+                    ])
+                    self.assertEqual([line.split('\t')[-1] for line in lines[4:]], ['/srv/large', '/srv/small'])
+                    result = subprocess.run([*command, '--json'], capture_output=True, text=True, timeout=3)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    payload = json.loads(result.stdout)
+                    self.assertEqual(payload['status'], 'partial')
+                    self.assertEqual(payload['partial_hosts'], {'example': entry.notes})
+                    self.assertEqual([item['path'] for item in payload['items']], ['/srv/large', '/srv/small'])
+
+            entry.actions = [dict(tier='archive', action='error', path='/srv/restricted', bytes=0, reason='unreadable')]
+            fleet.snapshot(root, [entry], None, sha, {'example': scanned})
+            result = subprocess.run(command, capture_output=True, text=True, timeout=3)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn('example has no scan under the current rules', result.stdout)
+
     def test_ranks_candidates_without_writes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -92,9 +141,8 @@ class TopTests(unittest.TestCase):
                     'schema_version': 1, 'status': 'refused', 'reason': 'invalid arguments; see stderr',
                 })
 
-            with self.subTest(mode='partial scan'):
-                entry.notes.append('Unreadable, skipped: restricted folder')
-                fleet.snapshot(reports, [entry], None, sha, {'example': scanned})
+            with self.subTest(mode='no scan under current rules'):
+                fleet.snapshot(reports, [entry], None, 'old-rules', {'example': scanned})
                 before = snapshot()
                 result = invoke()
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

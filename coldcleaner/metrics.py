@@ -9,7 +9,7 @@ from . import locking, report, store
 from .report_files import is_apply, log_paths, timestamp, written
 
 DAYS = 7
-TIERS = ('worktree', 'clone', 'archive')
+TIERS = ('worktree', 'clone', 'archive', 'rebuild')
 USAGE = re.compile(r'(Before|After): ([\d.]+)% \([\d.]+ GiB \((\d+) bytes\) of [\d.]+ GiB \((\d+) bytes\)\)')
 DRILL_RESULTS = ('pass', 'fail')
 HUMAN_COMMANDS = ('approve', 'restore', 'find')

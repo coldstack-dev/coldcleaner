@@ -109,13 +109,15 @@ class DiskTests(CoreCase):
 
 
 class ProtectionTests(CoreCase):
-    def scheduler_inventory(self, root, load_state='', entries=None):
+    def scheduler_inventory(self, root, load_state='', entries=None, commands=None):
         walk = os.walk
         def unit_walk(path):
             if path != '/etc/systemd/system':
                 return []
             return [(str(root), [], entries)] if entries else walk(root)
         def run(command, **kwargs):
+            if commands is not None:
+                return commands(command)
             state = load_state.get(command[-1], 'not-found') if isinstance(load_state, dict) else load_state
             return SimpleNamespace(stdout=state if 'show' in command else '', stderr='', returncode=0)
         output = io.StringIO()
@@ -124,6 +126,200 @@ class ProtectionTests(CoreCase):
              contextlib.redirect_stdout(output):
             exec(protect.SCHEDULERS, {})
         return json.loads(output.getvalue())
+
+    def test_installed_user_service_and_drop_in_protect_paths_missing_from_wildcard(self):
+        loaded = '/jobs/loaded'
+        installed = '/jobs/unloaded'
+        override = '/jobs/override'
+
+        def commands(command):
+            output = ''
+            if 'list-unit-files' in command:
+                output = 'idle.service disabled enabled\n'
+            elif 'cat' in command and '*' in command:
+                output = 'WorkingDirectory=' + loaded
+            elif 'cat' in command and 'idle.service' in command:
+                output = 'WorkingDirectory=' + installed + '\n# idle.service.d/custom.conf\nExecStart=' + override
+            return subprocess.CompletedProcess(command, 0, output, '')
+
+        obj = self.scheduler_inventory(self.root, commands=commands)
+        self.assertEqual(obj['errors'], [])
+        paths = protect.extract_paths(obj['text'], obj['home'])
+        self.assertTrue({loaded, installed, override} <= paths, paths)
+
+    def test_failed_installed_user_unit_inventory_holds_unrelated_candidate(self):
+        for failure in ('list-unit-files', 'idle.service'):
+            with self.subTest(failure=failure):
+                def commands(command):
+                    if failure in command:
+                        return subprocess.CompletedProcess(command, 1, '', 'Permission denied')
+                    output = 'idle.service disabled enabled\n' if 'list-unit-files' in command else ''
+                    return subprocess.CompletedProcess(command, 0, output, '')
+
+                obj = self.scheduler_inventory(self.root, commands=commands)
+                self.assertTrue(obj['errors'])
+                protection = protect.Protection(self.host, obj['home'], set(), obj['errors'])
+                self.assertIn('inventory incomplete', protection.reason('/unrelated'))
+
+    def test_vanished_user_unit_keeps_its_candidates_and_processes_others(self):
+        vanished = self.candidate('vanished')
+        other = self.candidate('other')
+        unrelated = self.candidate('unrelated')
+        list_calls = 0
+
+        def commands(command):
+            nonlocal list_calls
+            if 'cat' in command and '*' in command:
+                return subprocess.CompletedProcess(command, 0, 'WorkingDirectory=' + vanished.path + '\n', '')
+            if 'list-unit-files' in command:
+                list_calls += 1
+                output = 'other.service disabled enabled\n'
+                if list_calls == 1:
+                    output = 'vanished.scope transient -\n' + output
+                return subprocess.CompletedProcess(command, 0, output, '')
+            if 'cat' in command:
+                if 'vanished.scope' in command:
+                    return subprocess.CompletedProcess(
+                        command, 1, 'WorkingDirectory=' + other.path + '\n',
+                        'No files found for vanished.scope.\n')
+                return subprocess.CompletedProcess(command, 0, 'WorkingDirectory=' + other.path + '\n', '')
+            if 'show' in command and command[-1] == 'vanished.scope':
+                return subprocess.CompletedProcess(command, 0, 'not-found\n', '')
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        obj = self.scheduler_inventory(self.root, commands=commands)
+        self.assertEqual(obj['errors'], [])
+        protection = protect.Protection(
+            self.host, obj['home'], protect.extract_paths(obj['text'], obj['home']), obj['errors'])
+        reasons = protection.batch([vanished.path, other.path, unrelated.path])
+        self.assertIn('scheduler references', reasons[vanished.path])
+        self.assertIn('scheduler references', reasons[other.path])
+        self.assertEqual(reasons[unrelated.path], '')
+
+    def test_confirmed_vanished_unloaded_and_template_user_units_proceed(self):
+        other = self.candidate('other')
+        unrelated = self.candidate('unrelated')
+        for unit in ('gone.service', 'gone@.service'):
+            with self.subTest(unit=unit):
+                list_calls = 0
+
+                def commands(command):
+                    nonlocal list_calls
+                    if 'list-unit-files' in command:
+                        list_calls += 1
+                        output = 'other.service disabled enabled\n'
+                        if list_calls == 1:
+                            output = unit + ' disabled enabled\n' + output
+                        return subprocess.CompletedProcess(command, 0, output, '')
+                    if 'cat' in command and '*' not in command:
+                        if unit in command:
+                            return subprocess.CompletedProcess(
+                                command, 1, '', f'No files found for {unit}.\n')
+                        return subprocess.CompletedProcess(command, 0, 'WorkingDirectory=' + other.path + '\n', '')
+                    if 'show' in command and command[-1] == unit:
+                        return subprocess.CompletedProcess(command, 0, 'not-found\n', '')
+                    if 'list-units' in command and command[-1] == 'gone@*.service':
+                        return subprocess.CompletedProcess(command, 0, '', '')
+                    return subprocess.CompletedProcess(command, 0, '', '')
+
+                obj = self.scheduler_inventory(self.root, commands=commands)
+                self.assertEqual(obj['errors'], [])
+                protection = protect.Protection(
+                    self.host, obj['home'], protect.extract_paths(obj['text'], obj['home']), obj['errors'])
+                reasons = protection.batch([other.path, unrelated.path])
+                self.assertIn('scheduler references', reasons[other.path])
+                self.assertEqual(reasons[unrelated.path], '')
+
+    def test_unconfirmed_or_unreadable_user_unit_still_holds_all_candidates(self):
+        unrelated = self.candidate('unrelated')
+        cases = (
+            'still-installed',
+            'still-loaded',
+            'template-instance-loaded',
+            'unreadable-dropin-with-vanished',
+            'unreadable-remaining-on-retry',
+            'unexpected-unit-name',
+            'recheck-list-fails',
+            'show-fails',
+            'template-list-units-fails',
+            'second-missing-still-loaded',
+            'unexpected-exit-code',
+            'zero-exit-with-stderr',
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                list_calls = 0
+                unit = 'tpl@.service' if case in ('template-instance-loaded', 'template-list-units-fails') else 'gone.service'
+
+                def commands(command):
+                    nonlocal list_calls
+                    if 'list-unit-files' in command:
+                        list_calls += 1
+                        if list_calls == 1:
+                            extra = 'active.service disabled enabled\n' if case == 'second-missing-still-loaded' else ''
+                            return subprocess.CompletedProcess(
+                                command, 0, f'{unit} disabled enabled\n{extra}other.service disabled enabled\n', '')
+                        if case == 'still-installed':
+                            return subprocess.CompletedProcess(
+                                command, 0, f'{unit} disabled enabled\nother.service disabled enabled\n', '')
+                        if case == 'recheck-list-fails':
+                            return subprocess.CompletedProcess(command, 1, '', 'Failed to connect to bus\n')
+                        return subprocess.CompletedProcess(command, 0, 'other.service disabled enabled\n', '')
+                    if 'cat' in command and '*' not in command:
+                        if unit in command:
+                            if case == 'unreadable-dropin-with-vanished':
+                                return subprocess.CompletedProcess(
+                                    command, 1, '',
+                                    f'No files found for {unit}.\nFailed to open other.service.d/override.conf: Permission denied\n')
+                            if case == 'second-missing-still-loaded':
+                                return subprocess.CompletedProcess(
+                                    command, 1, '',
+                                    f'No files found for {unit}.\nNo files found for active.service.\n')
+                            if case == 'unexpected-unit-name':
+                                return subprocess.CompletedProcess(
+                                    command, 1, '', 'No files found for alien.service.\n')
+                            if case == 'unexpected-exit-code':
+                                return subprocess.CompletedProcess(
+                                    command, 2, '', f'No files found for {unit}.\n')
+                            if case == 'zero-exit-with-stderr':
+                                return subprocess.CompletedProcess(
+                                    command, 0, '', 'Warning: drop-in unreadable\n')
+                            return subprocess.CompletedProcess(
+                                command, 1, '', f'No files found for {unit}.\n')
+                        if case == 'unreadable-remaining-on-retry':
+                            return subprocess.CompletedProcess(
+                                command, 1, '', 'Failed to open other.service.d/override.conf: Permission denied\n')
+                        return subprocess.CompletedProcess(command, 0, '', '')
+                    if 'show' in command:
+                        if case == 'show-fails':
+                            return subprocess.CompletedProcess(command, 1, '', 'Failed to connect\n')
+                        if case == 'still-loaded' or (case == 'second-missing-still-loaded' and command[-1] == 'active.service'):
+                            return subprocess.CompletedProcess(command, 0, 'loaded\n', '')
+                        return subprocess.CompletedProcess(command, 0, 'not-found\n', '')
+                    if 'list-units' in command and command[-1] == 'tpl@*.service':
+                        if case == 'template-list-units-fails':
+                            return subprocess.CompletedProcess(command, 1, '', 'Failed to connect\n')
+                        return subprocess.CompletedProcess(command, 0, 'tpl@one.service loaded active running\n', '')
+                    return subprocess.CompletedProcess(command, 0, '', '')
+
+                obj = self.scheduler_inventory(self.root, commands=commands)
+                self.assertTrue(obj['errors'], case)
+                protection = protect.Protection(self.host, obj['home'], set(), obj['errors'])
+                self.assertIn('inventory incomplete', protection.reason(unrelated.path))
+
+    def test_wildcard_missing_device_diagnostic_cannot_hide_an_unreadable_unit(self):
+        for additional_error in ('', '\nPermission denied'):
+            with self.subTest(additional_error=additional_error):
+                def commands(command):
+                    if '*' in command:
+                        return subprocess.CompletedProcess(command, 1, '', 'No files found for absent.device.' + additional_error)
+                    return subprocess.CompletedProcess(command, 0, '', '')
+
+                obj = self.scheduler_inventory(self.root, commands=commands)
+                if additional_error:
+                    self.assertIn('Permission denied', '\n'.join(obj['errors']))
+                else:
+                    self.assertEqual(obj['errors'], [])
 
     def test_linked_systemd_units_protect_references_and_deduplicate_targets(self):
         units = self.root / 'units'

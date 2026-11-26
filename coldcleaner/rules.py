@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from . import hosts
 
-TIERS = ('worktree', 'clone', 'archive')
+TIERS = ('worktree', 'clone', 'archive', 'rebuild')
 REGENERABLE_NAMES = ('node_modules', '.venv', 'venv', 'target', 'dist', 'build', '__pycache__', '.cache', '.next')
 REMOVED_KEYS = ('hard_pct', 'project_idle_days', 'compact_idle_days', 'compact_weekday', 'nas_cap_gb', 'regenerable_paths')
 REMOVED_TIERS = ('github', 'project', 'compact')
@@ -26,7 +26,7 @@ DEFAULT_PATH = default_path()
 TOP_LEVEL_KEYS = frozenset({
     'alert_pct', 'worktree_idle_days', 'archive_idle_days', 'abandoned_idle_days',
     'nas_root', 'local_archive_mount', 'report_dir', 'live', 'approval',
-    'already_compressed_extensions', 'hosts', 'reclaim_hosts', 'collect_hosts', 'actions_log_mb', 'manual_notes',
+    'already_compressed_extensions', 'hosts', 'reclaim_hosts', 'collect_hosts', 'agent_worktree_hosts', 'actions_log_mb', 'manual_notes',
     'max_items_per_run', 'max_gib_per_run', 'attention_note', 'memory_store',
     'archive_before_delete', 'backup_copy_check', 'notes_vault', 'wait_period_days', 'quarantine_days',
 })
@@ -37,8 +37,8 @@ REQUIRED_KEYS = (
 LOCAL_POLICY_KEYS = {'report_dir', 'archive_before_delete', 'live'}
 HOST_KEYS = frozenset({'roots', 'archive', 'shared_roots', 'protected', 'exclude', 'kind', 'ssh', 'distro',
                        'max_items_per_run', 'max_gib_per_run', 'managed_bytes_target'} | LOCAL_POLICY_KEYS)
-ARCHIVE_ENTRY_KEYS = ('path', 'days', 'backup', 'exclude', 'category', 'approval', 'preservation', 'age_days')
-APPROVAL_TIERS = ('worktree', 'clone', 'archive')
+ARCHIVE_ENTRY_KEYS = ('path', 'days', 'backup', 'exclude', 'category', 'approval', 'preservation', 'age_days', 'children')
+APPROVAL_TIERS = ('worktree', 'clone', 'archive', 'rebuild')
 BACKUPS = ('nas', 'none-if-regenerable')
 CATEGORIES = ('scratch', 'test-output', 'artifact')
 PRESERVATION = ('sha256', 'summary')
@@ -229,6 +229,14 @@ def load(path=DEFAULT_PATH, local=None, report_dir=None):
     for index, name in enumerate(reclaim_hosts):
         if not isinstance(name, str) or name not in registry:
             raise ValueError(f'reclaim_hosts[{index}]: unknown host: {name!r}; known hosts: {", ".join(sorted(registry))}')
+    agent_hosts = data.get('agent_worktree_hosts', [])
+    if not isinstance(agent_hosts, list):
+        raise ValueError('agent_worktree_hosts must be an array of host names')
+    for index, name in enumerate(agent_hosts):
+        if not isinstance(name, str) or name not in registry or registry[name].kind != 'posix':
+            raise ValueError(f'agent_worktree_hosts[{index}]: expected a configured POSIX host, got {name!r}')
+        if name in agent_hosts[:index]:
+            raise ValueError(f'agent_worktree_hosts[{index}]: repeated host {name!r}')
     collect_hosts = data.get('collect_hosts', [])
     if not isinstance(collect_hosts, list):
         raise ValueError('collect_hosts must be an array of host names')
@@ -330,6 +338,8 @@ def check_archive_entry(where, entry):
         raise ValueError(f'{where}.preservation must be one of {", ".join(PRESERVATION)} on an artifact entry, got {entry["preservation"]!r}')
     if type(entry.get('approval', False)) is not bool:
         raise ValueError(f'{where}.approval must be true or false, got {entry["approval"]!r}')
+    if type(entry.get('children', False)) is not bool:
+        raise ValueError(f'{where}.children must be true or false, got {entry["children"]!r}')
     exclude = entry.get('exclude', [])
     if not isinstance(exclude, list):
         raise ValueError(f'{where}.exclude must be an array, got {exclude!r}')

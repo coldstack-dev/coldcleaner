@@ -256,6 +256,20 @@ class ReclaimTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'origin must be GitHub'):
                 reclaim.repository(url)
 
+    def test_pr_lookup_matches_heads_under_the_renamed_owner(self):
+        moved = dict(state='MERGED', headRefOid='abc', url='moved', headRepository=dict(nameWithOwner='new-org/repo'))
+        foreign = dict(state='OPEN', headRefOid='abc', url='foreign', headRepository=dict(nameWithOwner='old-org/fork'))
+        page = dict(nodes=[moved, foreign], pageInfo=dict(hasNextPage=False, endCursor=None))
+        root = dict(nameWithOwner='new-org/repo', parent=None, pullRequests=page, object=dict(associatedPullRequests=page))
+        response = Mock(stdout=json.dumps(dict(data=dict(repository=root))))
+        with patch.object(hosts, 'controller', return_value=response) as run:
+            self.assertEqual(reclaim.pull_requests('old-org/repo', 'done', 'abc'), [moved])
+        self.assertIn('owner=old-org', run.call_args.args[0])
+        batched = Mock(stdout=json.dumps(dict(data=dict(r0=root))))
+        with patch.object(hosts, 'controller', return_value=batched):
+            self.assertEqual(reclaim.pull_requests_batch([('old-org/repo', 'done', 'abc')]),
+                             {('old-org/repo', 'done', 'abc'): [moved]})
+
     def test_pr_lookup_rejects_same_head_from_another_repository(self):
         own = dict(state='CLOSED', headRefOid='abc', url='own',
                    headRepository=dict(nameWithOwner='me/repo'))
@@ -953,6 +967,29 @@ class ReclaimTests(unittest.TestCase):
         self.assertIn('process-use inventory incomplete', self.entry.actions[-1]['reason'])
         self.assertFalse((self.root / 'nas').exists())
 
+    def test_archive_scratch_children_holds_only_busy_recent_and_cache_children(self):
+        scratch = self.root / 'projects' / 'app' / '.scratch'
+        stamp = time.time() - 8 * 86400
+        for name in ('busy', 'idle', 'recent', 'with-cache'):
+            child = scratch / name
+            child.mkdir(parents=True)
+            (child / 'data').write_text(name)
+            if name != 'recent':
+                if name == 'with-cache':
+                    (child / 'npm-cache').mkdir()
+                    os.utime(child / 'npm-cache', (stamp, stamp))
+                for path in (child / 'data', child):
+                    os.utime(path, (stamp, stamp))
+        self.config['hosts']['test']['archive'] = ['~/projects/*/.scratch/*']
+        self.config['archive_idle_days'] = 7
+        reclaim_probe.references.return_value = [str(scratch / 'busy' / 'data')]
+        self.engine.archives()
+        rows = {Path(row['path']).name: (row['action'], row['reason']) for row in self.entry.actions}
+        self.assertEqual({name for name, (action, _) in rows.items() if action == 'would archive and remove'}, {'idle'})
+        self.assertEqual(rows['busy'], ('skip', f'running process uses {scratch / "busy" / "data"}'))
+        self.assertEqual(rows['recent'], ('skip', 'recent activity within 7 days'))
+        self.assertEqual(rows['with-cache'], ('skip', f'package caches are excluded: {scratch / "with-cache" / "npm-cache"}'))
+
     def test_posix_process_arguments_preserve_spaces(self):
         process = self.root / 'proc/4242'; (process / 'fd').mkdir(parents=True)
         job = self.root / 'my job'; job.mkdir()
@@ -1221,6 +1258,284 @@ class ReclaimTests(unittest.TestCase):
         self.config['hosts']['test']['roots'] = [str(work)]
         return repo, work
 
+    def old_git_date(self):
+        env = patch.dict(os.environ, GIT_COMMITTER_DATE=f'{int(time.time() - 8 * 86400)} +0000')
+        env.start()
+        self.addCleanup(env.stop)
+
+    def agent_worktree(self):
+        self.old_git_date()
+        repo, old = self.abandoned_worktree()
+        work = self.root / 'worktrees' / 'agent'
+        work.parent.mkdir()
+        self.git(repo, 'worktree', 'move', str(old), str(work))
+        self.config['agent_worktree_hosts'] = ['test']
+        self.config['hosts']['test']['roots'] = [str(work)]
+        (work / '.gitignore').write_text('.venv*/\n')
+        self.protection = self.engine.protection = protect.Protection(self.host, str(self.root), set(), [])
+        lsof = self.root / 'lsof'
+        lsof.write_text('#!/bin/sh\nexit 1\n')
+        lsof.chmod(0o755)
+        env = patch.dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ['PATH'])
+        env.start()
+        self.addCleanup(env.stop)
+        generated = work / '.venv-test'
+        generated.mkdir()
+        (generated / 'lib').mkdir()
+        (generated / 'lib64').symlink_to('lib')
+        (generated / 'cache').write_bytes(b'generated')
+        (work / 'source-link').symlink_to('untracked')
+        (work / 'absolute-link').symlink_to(work / 'tracked')
+        return repo, work
+
+    def age_agent(self, work, days=4):
+        stamp = time.time() - days * 86400
+        admin = Path(self.git(work, 'rev-parse', '--absolute-git-dir'))
+        for path in [*work.rglob('*'), work, admin / 'HEAD', admin / 'index']:
+            os.utime(path, (stamp, stamp), follow_symlinks=False)
+
+    def test_dead_agent_archive_restores_source_links_commits_and_stashes(self):
+        repo, work = self.agent_worktree()
+        stashes = []
+        for content in ('older stash', 'latest stash'):
+            (repo / 'tracked').write_text(content)
+            self.git(repo, 'stash', 'push')
+            stashes.append(self.git(repo, 'rev-parse', 'refs/stash'))
+        (work / 'cmd/build').mkdir(parents=True)
+        (work / 'cmd/build/main.go').write_text('package main')
+        self.age_agent(work)
+        head = self.git(work, 'rev-parse', 'HEAD')
+        plan, items = self.abandoned_plan()
+        self.assertEqual([item['path'] for item in items], [str(work)])
+        self.assertEqual(self.approve(plan, items[0]['id'])[0], 0)
+        row = self.apply_worktrees()
+        self.assertFalse(work.exists(), row)
+        self.assertNotIn(str(work), self.git(repo, 'worktree', 'list', '--porcelain'))
+        self.assertEqual(self.git(repo, 'rev-parse', 'done'), head)
+        restored = self.restored_copy(work)
+        self.assertEqual((restored / 'tracked').read_text(), 'dirty edit')
+        self.assertEqual((restored / 'untracked').read_bytes(), b'unique bytes')
+        self.assertEqual(os.readlink(restored / 'source-link'), 'untracked')
+        self.assertEqual(os.readlink(restored / 'absolute-link'), 'tracked')
+        self.assertFalse((restored / '.venv-test').exists())
+        self.assertEqual((restored / 'cmd/build/main.go').read_text(), 'package main')
+        self.assertEqual(self.git(restored, 'rev-parse', 'HEAD'), head)
+        record, = store._read_index(self.root / 'nas')
+        reclaim.check_restore(record, Path(record.archive_path), self.root)
+        for sha, content in zip(stashes, ('older stash', 'latest stash')):
+            self.assertEqual(self.git(restored, 'show', sha + ':tracked'), content)
+
+    def published_agent_worktree(self):
+        repo, work = self.agent_worktree()
+        self.git(work, 'add', '-A')
+        self.git(work, 'commit', '-m', 'publish agent work')
+        self.git(work, 'push', 'origin', 'HEAD:main', 'done')
+        self.age_agent(work)
+        return repo, work
+
+    def test_agent_retirement_removes_checkout_and_git_registration(self):
+        repo, work = self.published_agent_worktree()
+        row = self.apply_worktrees()
+        self.assertEqual(row['action'], 'remove worktree and local branch', row['reason'])
+        self.assertEqual(list(work.parent.iterdir()), [])
+        listing = self.git(repo, 'worktree', 'list', '--porcelain')
+        self.assertEqual([line for line in listing.splitlines() if line.startswith('worktree ')], ['worktree ' + str(repo)])
+        self.assertTrue((self.restored_copy(work) / 'untracked').is_file())
+
+    def test_agent_branch_update_failure_restores_removed_checkout(self):
+        repo, work = self.published_agent_worktree()
+        listing = self.git(repo, 'worktree', 'list', '--porcelain')
+        run = subprocess.run
+
+        def fail_branch_cleanup(argv, *args, **kwargs):
+            if 'update-ref' in argv and '-d' in argv:
+                self.assertFalse(work.exists())
+                self.assertNotIn(str(work), self.git(repo, 'worktree', 'list', '--porcelain'))
+                raise OSError('injected branch update failure')
+            return run(argv, *args, **kwargs)
+
+        with patch.object(subprocess, 'run', side_effect=fail_branch_cleanup):
+            row = self.apply_worktrees()
+        self.assertIn('injected branch update failure', row['reason'])
+        self.assertEqual(self.git(repo, 'worktree', 'list', '--porcelain'), listing)
+        self.assertEqual(self.git(work, 'status', '--porcelain'), '')
+        self.assertEqual(list(work.parent.iterdir()), [work])
+
+    def test_agent_git_removal_error_restores_original_checkout_and_registration(self):
+        repo, work = self.agent_worktree()
+        self.age_agent(work)
+        plan, items = self.abandoned_plan()
+        self.assertEqual(self.approve(plan, items[0]['id'])[0], 0)
+        admin = Path(self.git(work, 'rev-parse', '--absolute-git-dir'))
+        listing = self.git(repo, 'worktree', 'list', '--porcelain')
+        git = reclaim_probe.git
+
+        def refuse_remove(path, *args, **kwargs):
+            if args[:2] == ('worktree', 'remove'):
+                removing = Path(args[-1])
+                (removing / 'untracked').unlink()
+                (removing / '.venv-test/cache').unlink()
+                (next(admin.parent.iterdir()) / 'HEAD').unlink()
+                raise RuntimeError('injected Git removal failure')
+            return git(path, *args, **kwargs)
+
+        with patch.object(reclaim_probe, 'git', side_effect=refuse_remove):
+            row = self.apply_worktrees()
+        self.assertIn('injected Git removal failure', row['reason'])
+        self.assertEqual(list(work.parent.iterdir()), [work])
+        self.assertEqual(list(admin.parent.iterdir()), [admin])
+        self.assertEqual(list(admin.parent.parent.glob('.coldcleaner-rollback-*')), [])
+        self.assertEqual(self.git(repo, 'worktree', 'list', '--porcelain'), listing)
+        self.assertEqual(self.git(work, 'rev-parse', '--absolute-git-dir'), str(admin))
+        self.assertEqual((admin / 'gitdir').read_text().strip(), str(work / '.git'))
+        self.assertEqual((work / 'untracked').read_bytes(), b'unique bytes')
+        self.assertEqual((work / '.venv-test/cache').read_bytes(), b'generated')
+
+    def test_agent_restore_io_error_reports_both_surviving_copies(self):
+        repo, work = self.published_agent_worktree()
+        git = reclaim_probe.git
+        rename = os.rename
+
+        def fail_after_removal(path, *args, **kwargs):
+            result = git(path, *args, **kwargs)
+            if args[:2] == ('worktree', 'remove'):
+                raise OSError('lost Git result')
+            return result
+
+        def refuse_admin_restore(source, destination):
+            if Path(source).name == 'original' and Path(destination).parent.name == 'worktrees' and repo in Path(destination).parents:
+                raise OSError('injected admin restore failure')
+            return rename(source, destination)
+
+        with patch.object(reclaim_probe, 'git', side_effect=fail_after_removal), patch.object(os, 'rename', side_effect=refuse_admin_restore):
+            row = self.apply_worktrees()
+        self.assertIn('rollback incomplete', row['reason'])
+        self.assertIn('injected admin restore failure', row['reason'])
+        saved_work, = work.parent.glob('.*.coldcleaner-removing-*')
+        saved_admin, = (repo / '.git').glob('.coldcleaner-rollback-*/original')
+        for folder, member in ((saved_work, 'tracked'), (saved_admin, 'HEAD')):
+            self.assertIn(str(folder), row['reason'])
+            self.assertTrue((folder / member).is_file())
+
+    def test_dead_agent_cache_checks_escape_keep_local_age_and_activity(self):
+        _, work = self.agent_worktree()
+        cache = work / '.venv-test'
+        for name, target in (('outside', self.root), ('.keep-local', None)):
+            held = cache / name
+            if target:
+                held.symlink_to(target)
+            else:
+                held.touch()
+            self.age_agent(work)
+            self.assertEqual(self.abandoned_plan()[1], [])
+            held.unlink()
+        self.age_agent(work, 2)
+        self.assertEqual(self.abandoned_plan()[1], [])
+        self.age_agent(work)
+        for field, value in (('references', [str(cache / 'cache')]), ('threads', [('T3', str(work), None)])):
+            with patch.dict(self.engine.activity, {field: value}):
+                self.assertEqual(self.abandoned_plan()[1], [])
+        self.assertEqual(len(self.abandoned_plan()[1]), 1)
+
+    def test_dead_agent_archive_readback_failure_preserves_work_and_approval(self):
+        _, work = self.agent_worktree()
+        self.age_agent(work)
+        plan, items = self.abandoned_plan()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(self.approve(plan, items[0]['id'])[0], 0)
+        with patch.object(reclaim, 'read_archive', return_value={}):
+            row = self.apply_worktrees()
+        self.assertIn('NAS contents differ', row['reason'])
+        self.assertEqual((work / 'untracked').read_bytes(), b'unique bytes')
+        self.assertEqual((work / '.venv-test/cache').read_bytes(), b'generated')
+        self.assertIn(items[0]['id'], json.loads((Path(self.config['report_dir']) / reclaim.APPROVALS).read_text()))
+
+    def test_clean_dead_agent_restores_tracked_build_source_and_skips_generated_files(self):
+        self.old_git_date()
+        repo, work = self.worktree()
+        moved = self.root / 'worktrees' / 'finished'
+        moved.parent.mkdir()
+        self.git(repo, 'worktree', 'move', str(work), str(moved))
+        build = moved / 'build'
+        build.mkdir()
+        (build / 'tracked.py').write_text('source')
+        (moved / '.gitignore').write_text('build/generated.bin\n')
+        self.git(moved, 'add', '.')
+        self.git(moved, 'commit', '-m', 'tracked build source')
+        self.git(moved, 'push', 'origin', 'HEAD:main', 'done')
+        (build / 'generated.bin').write_text('regenerable')
+        self.config['agent_worktree_hosts'] = ['test']
+        self.config['hosts']['test']['roots'] = [str(moved)]
+        self.age_agent(moved)
+        row = self.apply_worktrees()
+        self.assertFalse(moved.exists(), row)
+        restored = self.restored_copy(moved)
+        self.assertEqual((restored / 'build/tracked.py').read_text(), 'source')
+        self.assertFalse((restored / 'build/generated.bin').exists())
+
+    def test_shallow_worktree_with_missing_history_logs_bundle_hold(self):
+        self.old_git_date()
+        repo, _ = self.worktree()
+        self.git(repo, 'commit', '--allow-empty', '-m', 'child')
+        self.git(repo, 'push', 'origin', 'main')
+        shallow = self.root / 'shallow'
+        self.git(self.root, 'clone', '--depth=1', '-b', 'main',
+                 (self.root / 'remote.git').as_uri(), str(shallow))
+        self.assertEqual(self.git(shallow, 'rev-parse', '--is-shallow-repository'), 'true')
+        work = self.root / 'worktrees' / 'finished'
+        self.git(shallow, 'worktree', 'add', '-b', 'finished', str(work))
+        head = self.git(work, 'rev-parse', 'HEAD')
+        self.config['agent_worktree_hosts'] = ['test']
+        self.config['hosts']['test']['roots'] = [str(work)]
+        self.age_agent(work)
+        row = self.apply_worktrees()
+        self.assertEqual(row['path'], str(work))
+        self.assertEqual(row['action'], 'skip')
+        self.assertIn('Git recovery bundle unavailable', row['reason'])
+        self.assertEqual(self.git(work, 'rev-parse', 'HEAD'), head)
+        self.assertIn(str(work), self.git(shallow, 'worktree', 'list', '--porcelain'))
+        self.assertEqual(store._read_index(Path(self.config['nas_root'])), [])
+
+    def test_bundle_transfer_errors_still_alert_after_metadata(self):
+        valid_metadata = json.dumps({'sha256': hashlib.sha256(b'').hexdigest()}).encode() + b'\n'
+        cases = [
+            (b'{}\n', 0, ValueError, 'missing SHA-256'),
+            (valid_metadata, 0, ValueError, 'empty bundle'),
+            (valid_metadata + b'truncated', 1, RuntimeError, 'transfer failed'),
+            (valid_metadata + b'changed', 0, RuntimeError, 'transfer failed'),
+        ]
+        for index, (stream, exit_code, error, reason) in enumerate(cases):
+            with self.subTest(reason=reason, exit_code=exit_code):
+                destination = self.root / str(index)
+                destination.mkdir()
+                producer = Mock(stdout=io.BytesIO(stream))
+                producer.wait.return_value = producer.poll.return_value = exit_code
+                with patch.object(hosts, 'python_stream', return_value=producer), self.assertRaisesRegex(error, reason):
+                    reclaim.preserve_git(self.host, 'work', destination, {'reflog': []})
+
+    def test_recent_git_activity_keeps_an_old_agent_worktree(self):
+        _, work = self.agent_worktree()
+        self.age_agent(work)
+        with patch.dict(os.environ, GIT_COMMITTER_DATE=f'{int(time.time())} +0000'):
+            self.git(work, 'commit', '--allow-empty', '-m', 'recent head')
+        self.age_agent(work)
+        self.assertEqual(self.abandoned_plan()[1], [])
+
+    def test_dead_agent_corrupt_bundle_before_removal_keeps_checkout(self):
+        _, work = self.agent_worktree()
+        self.age_agent(work)
+        plan, items = self.abandoned_plan()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(self.approve(plan, items[0]['id'])[0], 0)
+        def corrupt_bundle(path, drive, record):
+            bundle = Path(record.archive_path).parent / 'head.bundle'
+            bundle.write_bytes(b'corrupted on NAS')
+        with patch.object(self.engine, 'archive_present', side_effect=corrupt_bundle):
+            row = self.apply_worktrees()
+        self.assertIn('Git recovery bundle SHA-256 mismatch', row['reason'])
+        self.assertEqual((work / 'untracked').read_bytes(), b'unique bytes')
+        self.assertIn(items[0]['id'], json.loads((Path(self.config['report_dir']) / reclaim.APPROVALS).read_text()))
+
     def abandoned_plan(self):
         with patch.object(protect, 'collect', return_value=self.protection):
             self.engine.worktrees()
@@ -1264,7 +1579,7 @@ class ReclaimTests(unittest.TestCase):
                  'https://git.example.invalid/me/repo.git'),
                 (f'ssh://{userinfo}@git.example.invalid:2222/me/repo.git',
                  'ssh://git.example.invalid:2222/me/repo.git'),
-                ('fake-user@localhost:me/repo.git', 'localhost:me/repo.git'),
+                ('fake-user@git.example.invalid:me/repo.git', 'git.example.invalid:me/repo.git'),
                 ('git@github.com:me/repo.git', 'https://github.com/me/repo'),
                 (f'https://{userinfo}@github.com/me/repo.git', 'https://github.com/me/repo'),
             ):
@@ -2219,6 +2534,70 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual((row['action'], row['reason'], row['rule'], row['idle_days']),
                          ('skip', 'package caches are excluded', 'test.archive:' + str(cache), None))
 
+    def test_compute_cache_rules_archive_only_idle_regenerable_files(self):
+        self.config['hosts']['test']['archive'] = [
+            dict(path='~/.cache/coldpass/sources/*.tgz', days=7),
+            dict(path='~/.cache/coldpass/scans/*.json', days=14),
+            dict(path='~/.cache/coldpass/github-repos/*/*/*.json', days=14),
+            dict(path='~/.cache/t3-steer/*-nightly.*/t3', days=14),
+            '~/.cache/uv/*',
+        ]
+        files = {
+            'coldpass/sources/old.tgz': 8,
+            'coldpass/sources/recent.tgz': 6,
+            'coldpass/scans/old.json': 15,
+            'coldpass/scans/recent.json': 13,
+            'coldpass/github-repos/owner/repo/metadata.json': 15,
+            'coldpass/gh-token': 15,
+            't3-steer/0.1.3-nightly.20261026.3717/t3': 15,
+            't3-steer/0.1.3-nightly.20261027.3754/t3': 15,
+            'uv/old.zip': 15,
+        }
+        cache = self.root / '.cache'
+        for name, days in files.items():
+            path = cache / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('fixture')
+            stamp = time.time() - days * 86400
+            os.utime(path, (stamp, stamp))
+        linked = cache / 't3-steer/0.1.4-nightly.20261028.3809/t3'
+        linked.parent.mkdir()
+        linked.symlink_to(cache / 'coldpass/gh-token')
+        (cache / 'coldpass/scans/.keep-local').touch()
+        with patch.object(reclaim_probe, 'references', return_value=[str(cache / 't3-steer/0.1.3-nightly.20261027.3754/t3')]):
+            self.engine.archives()
+        rows = {Path(row['path']).relative_to(cache).as_posix(): row for row in self.entry.actions}
+        self.assertEqual({name for name, row in rows.items() if row['action'] == 'would archive and remove'},
+                         {'coldpass/sources/old.tgz', 'coldpass/github-repos/owner/repo/metadata.json',
+                          't3-steer/0.1.3-nightly.20261026.3717/t3'})
+        self.assertIn('recent activity', rows['coldpass/sources/recent.tgz']['reason'])
+        self.assertIn('.keep-local', rows['coldpass/scans/old.json']['reason'])
+        self.assertIn('running process', rows['t3-steer/0.1.3-nightly.20261027.3754/t3']['reason'])
+        self.assertIn('symlink ancestor', rows['t3-steer/0.1.4-nightly.20261028.3809/t3']['reason'])
+        self.assertEqual(rows['uv/old.zip']['reason'], 'package caches are excluded')
+        self.assertNotIn('coldpass/gh-token', rows)
+        self.assertEqual(set(files), {name for name in files if (cache / name).is_file()})
+
+    def test_allowlisted_agent_cache_files_are_removed_after_a_verified_copy(self):
+        self.config['hosts']['test']['archive'] = [dict(path='~/.cache/coldpass/sources/*.tgz', days=7),
+                                                   dict(path='~/.cache/t3-steer/*-nightly.*/t3', days=14)]
+        cache = self.root / '.cache'
+        policy = self.root / '.config' / 'coldcleaner' / 'local.json'
+        policy.write_text(json.dumps(dict(roots=[], archive=[str(cache / 'coldpass/sources/*.tgz'),
+                                                             str(cache / 't3-steer/*-nightly.*/t3')])))
+        files = [cache / 'coldpass/sources/old.tgz', cache / 't3-steer/0.1.3-nightly.20261026.3717/t3']
+        stamp = time.time() - 15 * 86400
+        for path in files:
+            path.parent.mkdir(parents=True)
+            path.write_text('fixture')
+            os.utime(path, (stamp, stamp))
+        self.engine.apply = True
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.archives()
+        self.assertEqual({row['path']: row['action'] for row in self.entry.actions},
+                         dict.fromkeys(map(str, files), 'archive and remove'))
+        self.assertFalse(any(path.exists() for path in files))
+
     def test_nested_package_cache_retains_the_entire_candidate(self):
         source = self.root / 'evidence'; source.mkdir()
         cache = source / 'nested' / '.npm'; cache.mkdir(parents=True)
@@ -2876,7 +3255,7 @@ class ReclaimTests(unittest.TestCase):
         old = [self.aged(name, 31) for name in ('a-first', 'b-second', 'c-busy')]
         self.config['hosts']['test']['archive'] = [str(self.root / 'evidence' / '*')]
         removals = []
-        def sessions(since=None):
+        def sessions(since=None, cached=True):
             if reclaim_probe.claude_threads.call_count > 1:
                 removals.append(True)
             return [(str(old[2]), time.time())] if len(removals) == 3 else []
@@ -3119,7 +3498,7 @@ class ReclaimTests(unittest.TestCase):
         self.assertTrue((source / 'late').exists())
         self.assertEqual(self.entry.actions[-1]['reason'], reclaim.APPROVAL_STALE)
 
-    def clones(self, *names):
+    def clones(self, *names, no_hardlinks=False):
         bare = self.root / 'remote.git'; seed = self.root / 'seed'
         self.git(self.root, 'init', '--bare', '-b', 'main', str(bare))
         seed.mkdir(); self.git(seed, 'init', '-b', 'main')
@@ -3130,7 +3509,8 @@ class ReclaimTests(unittest.TestCase):
         projects = self.root / 'projects'; projects.mkdir()
         made = []
         for name in names:
-            self.git(projects, 'clone', '-q', str(bare), name)
+            options = ['--no-hardlinks'] if no_hardlinks else []
+            self.git(projects, 'clone', '-q', *options, str(bare), name)
             for key, value in (('user.name', 'Test'), ('user.email', 'test@localhost'), ('commit.gpgsign', 'false')):
                 self.git(projects / name, 'config', key, value)
             made.append(projects / name)
@@ -3340,6 +3720,85 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual([source.exists() for source in sources], [False, True, True], rows)
         self.assertEqual([action for action, _ in rows], ['archive and remove', 'skip', 'skip'])
         self.assertEqual([reason for _, reason in rows[1:]], [reclaim.LIMIT_REACHED] * 2)
+
+    def test_archive_apply_checks_items_past_the_limit_only_in_the_shared_batch(self):
+        sources, rows = self.limited_archives([10, 10, 10, 10], max_items_per_run=1)
+        self.assertEqual([action for action, _ in rows], ['archive and remove', 'skip', 'skip', 'skip'])
+        self.protection.batch.assert_called_once_with([str(source) for source in sources])
+        checked = {call.args[0] for call in self.protection.reason.call_args_list}
+        self.assertIn(str(sources[0]), checked)
+        self.assertFalse(checked & {str(sources[2]), str(sources[3])})
+
+    def assert_git_removal_order_under_caps(self, tier, paths, run):
+        self.config.update(archive_before_delete='off', live=[tier],
+                           max_items_per_run=2, max_gib_per_run=2_800_000 / 1024**3)
+        for path, size in zip(paths, (60_000, 100_000, 1_500_000, 2_000_000, 4_000_000)):
+            payload = path / ('.git/size-test' if tier == 'clone' else 'evidence/payload')
+            payload.parent.mkdir(exist_ok=True)
+            self.written(payload, size)
+        run()
+        plan = Path(self.config['report_dir']) / 'limits.plan.json'
+        plan.parent.mkdir(parents=True)
+        reclaim.write_plan(plan, [self.entry], None)
+        self.assertEqual(self.approve(plan, 'all')[0], 0)
+        self.entry = self.engine.report = report.HostReport('test')
+        self.engine.apply = True
+        with patch.object(protect, 'collect', return_value=self.protection):
+            run()
+        smallest, small, medium, large, oversized = map(str, paths)
+        self.assertEqual([row['path'] for row in self.entry.actions if row['action'].startswith('remove')],
+                         [large, small], self.entry.actions)
+        self.assertEqual({row['path']: row['reason'] for row in self.entry.actions if row['path'] in
+                          (smallest, medium, oversized)}, dict.fromkeys((smallest, medium, oversized), reclaim.LIMIT_REACHED))
+        self.assertEqual([path.exists() for path in paths], [True, False, True, False, True])
+
+    def test_worktrees_remove_largest_that_fit_the_host_limits(self):
+        repo, small = self.worktree()
+        paths = [small]
+        for name in ('work-b', 'work-c', 'work-d', 'work-e'):
+            path = self.root / name
+            self.git(repo, 'worktree', 'add', '--detach', str(path))
+            paths.append(path)
+        self.assert_git_removal_order_under_caps('worktree', paths, self.engine.worktrees)
+
+    def test_clones_remove_largest_that_fit_the_host_limits(self):
+        kept, *paths = self.clones('keeper', 'smallest-copy', 'small-copy', 'medium', 'large', 'big',
+                                  no_hardlinks=True)
+        self.assert_git_removal_order_under_caps('clone', paths, self.engine.clones)
+        self.assertTrue(kept.is_dir())
+
+    def test_oversized_clone_can_be_the_checkout_kept_by_the_plan(self):
+        small, large = self.clones('tool', 'tool-copy', no_hardlinks=True)
+        self.written(large / '.git/size-test', 4_000_000)
+        self.config.update(archive_before_delete='off', live=['clone'], max_gib_per_run=2_800_000 / 1024**3)
+        self.clone_run()
+        plan = Path(self.config['report_dir']) / 'limits.plan.json'
+        plan.parent.mkdir(parents=True)
+        reclaim.write_plan(plan, [self.entry], None)
+        self.assertEqual(self.approve(plan, 'all')[0], 0)
+        rows = self.clone_run(apply=True)
+        self.assertEqual(rows['tool'][0], 'remove clone', rows)
+        self.assertEqual(rows['tool-copy'], ('skip', reclaim.LIMIT_REACHED))
+        self.assertFalse(small.exists())
+        self.assertTrue(large.is_dir())
+
+    def test_tiny_archives_do_not_use_all_slots_before_the_largest(self):
+        sources, rows = self.limited_archives([10] * 8 + [500_000], max_items_per_run=2)
+        self.assertFalse(sources[-1].exists(), rows)
+        self.assertEqual(sum(not source.exists() for source in sources), 2)
+        self.assertEqual(rows[2:], [('skip', reclaim.LIMIT_REACHED)] * 7)
+
+    def test_archive_size_order_survives_a_failed_prefetch_batch(self):
+        local = reclaim.probe.side_effect
+
+        def failing(host, operation, **request):
+            if operation == 'batch':
+                raise RuntimeError('ssh dropped')
+            return local(host, operation, **request)
+
+        with patch.object(reclaim.probe, 'side_effect', failing):
+            sources, rows = self.limited_archives([10, 10, 500_000], max_items_per_run=1)
+        self.assertEqual([source.exists() for source in sources], [True, True, False], rows)
 
     def test_run_deadline_finishes_the_item_in_flight_then_stops(self):
         original = reclaim.preserve
@@ -3641,6 +4100,39 @@ class ReclaimTests(unittest.TestCase):
         self.assertIn('protected location: ' + str(source), rows[0]['reason'])
         self.assertTrue((source / 'data').exists())
 
+    def test_worktree_vault_fixtures_pass_reclaim_preview(self):
+        repo, work = self.worktree()
+        self.git(work, 'config', 'core.excludesFile', str(self.root / 'ignore'))
+        (self.root / 'ignore').write_text('.obsidian/\n')
+        (work / '.obsidian').mkdir()
+        (work / 'evidence' / 'fixture' / '.obsidian').mkdir(parents=True)
+        for name in ('.t3/worktrees', 'worktrees'):
+            with self.subTest(root=name):
+                target = self.root / name / 'project' / 'done'
+                target.parent.mkdir(parents=True)
+                self.git(repo, 'worktree', 'move', str(work), str(target))
+                work = target
+                self.config['hosts']['test']['roots'] = [str(target.parent)]
+                self.engine.worktrees()
+                self.assertEqual(self.entry.actions[-1]['action'], 'would remove worktree', self.entry.actions[-1])
+                reclaim_probe.guard(target / 'evidence')
+
+    def test_guard_protects_configured_obsidian_vault_inside_worktree(self):
+        repo, work = self.worktree()
+        target = self.root / '.t3' / 'worktrees' / 'project' / 'done'
+        target.parent.mkdir(parents=True)
+        self.git(repo, 'worktree', 'move', str(work), str(target))
+        vault = target / 'vault'
+        (vault / '.obsidian').mkdir(parents=True)
+        (vault / 'notes').mkdir()
+        config = self.root / '.config' / 'obsidian' / 'obsidian.json'
+        config.parent.mkdir()
+        config.write_text(json.dumps({'vaults': {'id': {'path': str(vault), 'open': False}}}))
+        with patch.dict(os.environ, XDG_CONFIG_HOME=str(config.parent.parent)), patch.object(sys, 'platform', 'linux'):
+            for path in (target, vault, vault / 'notes'):
+                with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'protected location: Obsidian vault'):
+                    reclaim_probe.guard(path)
+
     def test_guard_retains_process_thread_recent_symlink_and_keep_local(self):
         source = self.root / 'evidence'; source.mkdir(); (source / 'data').write_text('unique')
         alias = self.root / 'alias'; alias.symlink_to(source, target_is_directory=True)
@@ -3746,6 +4238,67 @@ class ReclaimTests(unittest.TestCase):
         session.write_text(''.join(json.dumps(dict(type='user', cwd=cwd)) + '\n' for cwd in cwds))
         os.utime(session, (time.time() - age,) * 2)
 
+    def test_claude_sessions_are_reread_only_when_they_change(self):
+        first, second = str(self.root / 'first'), str(self.root / 'second')
+        self.claude_session('-first/a.jsonl', [first], 3600)
+        self.claude_session('-second/b.jsonl', [second], 3600)
+        reads = []
+        original = Path.open
+        def counted(path, *args, **kwargs):
+            if path.suffix == '.jsonl':
+                reads.append(path.name)
+            return original(path, *args, **kwargs)
+        def scan():
+            reads.clear()
+            with patch.object(reclaim_probe, 'claude_threads', self.read_claude), patch.object(Path, 'open', counted):
+                found = reclaim_probe.workspaces()
+            self.assertEqual(found['blocked'], [])
+            return sorted(path for name, path, _ in found['threads'] if name == 'Claude Code'), sorted(reads)
+        self.assertEqual(scan(), ([first, second], ['a.jsonl', 'b.jsonl']))
+        self.assertEqual(scan(), ([first, second], []))
+        with (self.root / '.claude' / 'projects' / '-second' / 'b.jsonl').open('a') as session:
+            session.write(json.dumps(dict(type='user', cwd=second + '/sub')) + '\n')
+        self.assertEqual(scan(), ([first, second, second + '/sub'], ['b.jsonl']))
+        (self.root / '.claude' / 'projects' / '-first' / 'a.jsonl').write_text('not json\n')
+        with patch.object(reclaim_probe, 'claude_threads', self.read_claude):
+            self.assertEqual(reclaim_probe.workspaces()['blocked'],
+                             ['IN USE: Claude Code state unreadable, protecting every candidate: ValueError: unexpected cwd in '
+                              + str(self.root / '.claude' / 'projects' / '-first' / 'a.jsonl')])
+        (self.root / '.cache' / 'coldcleaner' / 'claude-sessions.json').write_text('{"broken"')
+        self.claude_session('-first/a.jsonl', [first], 3600)
+        self.assertEqual(scan(), ([first, second, second + '/sub'], ['a.jsonl', 'b.jsonl']))
+
+    def test_a_session_appending_the_candidate_during_its_stat_blocks_removal(self):
+        candidate = self.root / 'candidate'; candidate.mkdir(); (candidate / 'data').write_text('x')
+        now = int(time.time())
+        os.utime(candidate / 'data', (now - 30 * 86400,) * 2); os.utime(candidate, (now - 30 * 86400,) * 2)
+        self.claude_session('-other/a.jsonl', [str(self.root / 'other')], 3600)
+        session = self.root / '.claude' / 'projects' / '-other' / 'a.jsonl'
+        original = Path.stat
+        def appending(path, *args, **kwargs):
+            status = original(path, *args, **kwargs)
+            if path == session and not appended:
+                appended.append(True)
+                with open(session, 'a') as active:
+                    active.write(json.dumps(dict(type='user', cwd=str(candidate))) + '\n')
+            return status
+        with patch.object(reclaim_probe, 'claude_threads', self.read_claude):
+            self.assertEqual(reclaim_probe.workspaces()['blocked'], [])
+            for request in (dict(operation='activity'), dict(operation='guard', path=str(candidate), days=7)):
+                with self.subTest(operation=request['operation']):
+                    self.claude_session('-other/a.jsonl', [str(self.root / 'other')], 3600)
+                    self.assertEqual(reclaim_probe.workspaces()['blocked'], [])
+                    appended = []
+                    with patch.object(Path, 'stat', appending):
+                        if request['operation'] == 'activity':
+                            found = reclaim_probe.main(request)
+                            self.assertIn(str(candidate), [path for name, path, _ in found['threads'] if name == 'Claude Code'])
+                        else:
+                            with self.assertRaisesRegex(ValueError, '^Claude Code thread uses ' + re.escape(str(candidate)) + '$'):
+                                reclaim_probe.main(request)
+                    self.assertEqual(appended, [True])
+        self.assertTrue((candidate / 'data').exists())
+
     def test_claude_code_sessions_protect_recent_workspaces(self):
         now = int(time.time())
         recent, moved, idle, broad = (self.root / name for name in ('recent', 'moved', 'idle', 'broad'))
@@ -3831,7 +4384,7 @@ class ReclaimTests(unittest.TestCase):
         projects = self.root / 'evidence'
         old = self.aged('scratch', 31)
         self.config['hosts']['test'].update(roots=[str(projects)], archive=[dict(path=str(projects / '*'), days=30)])
-        reclaim_probe.claude_threads.side_effect = lambda since=None: [(str(projects), time.time())]
+        reclaim_probe.claude_threads.side_effect = lambda since=None, cached=True: [(str(projects), time.time())]
         rows = self.archive_now()
         self.assertFalse(old.exists(), rows)
         self.assertEqual(rows['scratch'], ('archive and remove', 30))
@@ -4371,7 +4924,7 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual(code, 1)
         refused = json.loads(stdout.getvalue())
         self.assertEqual(refused['status'], 'refused')
-        self.assertIn('none of worktree, clone or archive is listed in live', refused['reason'])
+        self.assertIn('none of worktree, clone, archive or rebuild is listed in live', refused['reason'])
 
     def test_apply_with_only_the_clone_tier_live_is_not_refused(self):
         self.config['live'] = ['clone']

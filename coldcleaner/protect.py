@@ -17,6 +17,38 @@ seen = set()
 def unit_not_loaded(name):
     result = subprocess.run(['systemctl', 'show', '--property=LoadState', '--value', name], capture_output=True, text=True)
     return result.returncode == 0 and result.stdout.strip() == 'not-found'
+def user_unit_absent(name, installed):
+    if name in installed:
+        return False
+    if '.' in name and name.rsplit('.', 1)[0].endswith('@'):
+        if any(ch in name for ch in '*?['):
+            return False
+        prefix, suffix = name.rsplit('.', 1)
+        result = subprocess.run(
+            ['systemctl', '--user', 'list-units', '--all', '--no-legend', '--no-pager', '--full', '--', prefix + '*.' + suffix],
+            capture_output=True, text=True)
+        return result.returncode == 0 and not result.stderr.strip() and not result.stdout.strip()
+    result = subprocess.run(['systemctl', '--user', 'show', '--property=LoadState', '--value', '--', name],
+                            capture_output=True, text=True)
+    return result.returncode == 0 and not result.stderr.strip() and result.stdout.strip() == 'not-found'
+def vanished_user_units(batch, result):
+    diagnostics = result.stderr.splitlines()
+    if result.returncode != 1 or not diagnostics:
+        return set()
+    missing = set()
+    for line in diagnostics:
+        if not (line.startswith('No files found for ') and line.endswith('.')):
+            return set()
+        name = line[len('No files found for '):-1]
+        if name not in batch:
+            return set()
+        missing.add(name)
+    check = subprocess.run(['systemctl', '--user', 'list-unit-files', '--no-legend', '--no-pager', '--full'],
+                           capture_output=True, text=True)
+    if check.returncode or check.stderr.strip():
+        return set()
+    installed = {line.split()[0] for line in check.stdout.splitlines() if line.strip()}
+    return missing if all(user_unit_absent(name, installed) for name in missing) else set()
 def read(path, unit=False):
     target = os.path.realpath(path)
     if target in seen:
@@ -44,8 +76,29 @@ if sys.platform == 'darwin':
 else:
     result = subprocess.run(['systemctl', '--user', 'cat', '*'], capture_output=True, text=True)
     text.append(result.stdout)
-    if result.returncode and 'No files found' not in result.stderr:
+    diagnostics = result.stderr.splitlines()
+    if (any(not line.startswith('No files found for ') for line in diagnostics)
+            or result.returncode and (result.returncode != 1 or not diagnostics)):
         errors.append('user systemd inventory failed: ' + result.stderr.strip())
+    result = subprocess.run(['systemctl', '--user', 'list-unit-files', '--no-legend', '--no-pager', '--full'],
+                            capture_output=True, text=True)
+    if result.returncode or result.stderr.strip():
+        errors.append('installed user systemd inventory failed: ' + result.stderr.strip())
+    else:
+        names = [line.split()[0] for line in result.stdout.splitlines() if line.strip()]
+        for start in range(0, len(names), 128):
+            batch = names[start:start + 128]
+            while batch:
+                result = subprocess.run(['systemctl', '--user', 'cat', '--', *batch],
+                                        capture_output=True, text=True)
+                text.append(result.stdout)
+                if not result.returncode and not result.stderr.strip():
+                    break
+                missing = vanished_user_units(batch, result)
+                if not missing:
+                    errors.append('installed user systemd unit read failed: ' + (result.stderr.strip() or f'exit {result.returncode}'))
+                    break
+                batch = [name for name in batch if name not in missing]
     for root in ('/etc/systemd/system', '/usr/lib/systemd/system', '/lib/systemd/system'):
         for base, dirs, files in os.walk(root):
             for name in files:
@@ -111,7 +164,8 @@ def broad_reference(path, home, windows=False):
 POSIX_BATCH = r'''
 import codecs, json, os, re, shutil, signal, subprocess, sys, time
 from pathlib import Path
-paths, allow_git, open_files = json.load(sys.stdin)
+paths, allow_git, open_files, *options = json.load(sys.stdin)
+internal_links = set(options[0]) if options else set()
 deadline = time.monotonic() + 840
 def timed_out(*args):
     raise TimeoutError('protection check timed out')
@@ -136,8 +190,10 @@ def check(path):
             return 'git metadata requires GitHub safety review'
         if '.keep-local' in files or '.keep-local' in dirs:
             return '.keep-local'
-        if any(os.path.islink(os.path.join(base, n)) for n in dirs + files):
-            return 'symlink descendant'
+        for name in dirs + files:
+            item = os.path.join(base, name)
+            if os.path.islink(item) and (path not in internal_links or not Path(item).resolve().is_relative_to(p)):
+                return 'symlink descendant'
     return ''
 reasons = {}
 pending = []
@@ -255,10 +311,10 @@ class Protection:
     errors: list[str]
     broad_paths: set[str] = field(default_factory=set)
 
-    def reason(self, path, *, allow_git=False):
-        return self.batch([path], allow_git=allow_git)[path]
+    def reason(self, path, *, allow_git=False, internal_links=False):
+        return self.batch([path], allow_git=allow_git, internal_links=[path] if internal_links else ())[path]
 
-    def batch(self, paths, *, allow_git=False, open_files=True):
+    def batch(self, paths, *, allow_git=False, open_files=True, internal_links=()):
         reasons = {}
         windows = self.host.kind == 'powershell'
         module = ntpath if windows else posixpath
@@ -285,8 +341,10 @@ class Protection:
                     return dict(reasons, **{path: detail for path in pending})
                 checked = json.loads(result.stdout)
             else:
-                checked = disk.python(self.host, POSIX_BATCH, timeout=900,
-                    stdin_bytes=json.dumps([pending, allow_git, open_files]).encode())
+                request = [pending, allow_git, open_files]
+                if internal_links:
+                    request.append(sorted(internal_links))
+                checked = disk.python(self.host, POSIX_BATCH, timeout=900, stdin_bytes=json.dumps(request).encode())
             if not isinstance(checked, dict):
                 raise ValueError('invalid protection response')
             for path in pending:

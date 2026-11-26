@@ -35,7 +35,7 @@ def configure(path, yes=False):
     print('Blank answers retain current settings. No cleanup runs during init.')
     mode = ask('1. Cleanup mode [preview/approve/auto]: ', ('preview', 'approve', 'auto'))
     if mode:
-        data['live'] = [] if mode == 'preview' else list(rules.TIERS)
+        data['live'] = [] if mode == 'preview' else [tier for tier in rules.TIERS if tier != 'rebuild']
         data['approval'] = list(rules.APPROVAL_TIERS) if mode == 'approve' else []
     for number, key, label in ((2, 'archive_before_delete', 'Archive before deleting'),
                                (3, 'backup_copy_check', 'Verify backup copy')):
@@ -47,24 +47,17 @@ def configure(path, yes=False):
         data['notes_vault'] = 'off' if vault == 'off' else 'on'
         if vault != 'off':
             data['memory_store'] = vault
-    print('Age-only scans children of matching POSIX folders; matching files are skipped. Off removes age-only entries.')
+    print('Age-only entries are POSIX archive entries with age_days. Off removes them; 30, 60 or 90 sets their age. '
+          'Other archive entries are unchanged.')
     age = ask('5. Age-only cleanup [off/30/60/90]: ', ('off', '30', '60', '90'))
     if age:
         for host in data['hosts'].values():
-            if host['kind'] != 'posix':
-                continue
-            entries = []
-            for entry in host.get('archive', []):
-                entry = dict(entry) if isinstance(entry, dict) else {'path': entry}
-                if age == 'off':
-                    if 'age_days' in entry:
-                        continue
-                else:
-                    entry.pop('days', None)
+            aged = [entry for entry in host.get('archive', []) if isinstance(entry, dict) and 'age_days' in entry]
+            if age != 'off':
+                for entry in aged:
                     entry['age_days'] = int(age)
-                entries.append(entry)
-            if 'archive' in host:
-                host['archive'] = entries
+            elif aged:
+                host['archive'] = [entry for entry in host['archive'] if entry not in aged]
     wait = input('6. Wait period in days [blank keeps current per-tier waits]: ').strip()
     if wait:
         days = float(wait)

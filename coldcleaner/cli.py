@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import collect, disk, doctor, fleet, hosts, metrics, protect, reclaim, report, store, rules, version
+from . import collect, disk, doctor, fleet, hosts, metrics, protect, reclaim, reflink, report, store, rules, version
 
 RETRY_SECONDS = 30
 JSON_SCHEMA_VERSION = 1
@@ -234,6 +234,12 @@ def positive(text):
     return int(text)
 
 
+def nonnegative(text):
+    if not text.isdigit():
+        raise argparse.ArgumentTypeError(f'must be a non-negative whole number of bytes, got {text!r}')
+    return int(text)
+
+
 def parser():
     result = argparse.ArgumentParser(prog='coldcleaner', description='Free disk space from finished Git worktrees and idle listed folders. '
                                      'Cleanup is a dry run unless you pass --apply.')
@@ -253,13 +259,16 @@ def parser():
                          'delete the copy and log pass or fail. Exit 1 on fail.',
         'approve': 'Approve items from a reclaim dry-run plan so reclaim --apply may act on them.',
         'triage': 'Summarize held worktrees by reason, repo and age, and optionally approve old abandoned ones for a verified archive copy.',
+        'reflink': 'Deduplicate identical clean files across Git worktrees using copy-on-write reflinks. Dry run unless --apply is passed.',
     }
     for name, description in descriptions.items():
         command = commands.add_parser(name, help=description, description=description)
-        command.add_argument('--rules', type=Path, default=rules.DEFAULT_PATH, help='Read configuration from this rules file.')
-        if name in ('reclaim', 'status', 'doctor', 'top', 'triage'):
+        rules_default = None if name == 'reflink' else rules.DEFAULT_PATH
+        command.add_argument('--rules', type=Path, default=rules_default, metavar='RULES',
+                             help='Read configuration from this rules file.')
+        if name in ('reclaim', 'status', 'doctor', 'top', 'triage', 'reflink'):
             command.add_argument('--host', help='Select one host instead of all hosts.')
-        if name in ('reclaim', 'doctor', 'top'):
+        if name in ('reclaim', 'doctor', 'top', 'reflink'):
             command.add_argument('--local', action='store_true', help='Run --host on this machine without ssh (its own nightly).')
         if name == 'init':
             command.add_argument('--yes', action='store_true', help='Retain current settings without prompting.')
@@ -274,6 +283,14 @@ def parser():
                                  help='Require this complete dry-run report to cover the selected hosts and current rules.')
         if name == 'top':
             command.add_argument('--json', action='store_true', help='Print one JSON breakdown.')
+        if name == 'reflink':
+            command.add_argument('--apply', action='store_true',
+                                 help='Replace duplicate clean files with copy-on-write reflinks instead of a dry run.')
+            command.add_argument('--json', action='store_true', help='Print one versioned JSON result.')
+            command.add_argument('--min-bytes', type=nonnegative, default=reflink.MIN_BYTES,
+                                 help=f'Minimum file size in bytes to consider (default {reflink.MIN_BYTES}).')
+            command.add_argument('paths', nargs='*', type=Path,
+                                 help='Optional local root or repository paths to scan instead of hosts from the rules file.')
         if name == 'metrics':
             command.add_argument('--days', type=positive, default=metrics.DAYS, help=f'Count the last N days (default {metrics.DAYS}).')
         if name == 'approve':
@@ -364,17 +381,54 @@ def previewed(config, selected):
     return [host for host in selected if host.name in covered]
 
 
+def _reflink_rules_protected(args):
+    explicit = args.rules is not None
+    rules_path = args.rules if explicit else rules.DEFAULT_PATH
+    if not explicit and not os.path.lexists(rules_path):
+        return []
+    config = rules.load(rules_path)
+    found = []
+    for host_cfg in config['hosts'].values():
+        if host_cfg.get('kind') == 'posix':
+            for item in host_cfg.get('protected', []):
+                if item not in found:
+                    found.append(item)
+    return found
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     try:
         args = parser().parse_args(argv)
     except SystemExit as exc:
         if exc.code == 2 and argv and '--json' in argv:
-            if argv[0] in STANDARD_JSON_COMMANDS:
+            if argv[0] in (*STANDARD_JSON_COMMANDS, 'reflink'):
                 return json_failure('invalid arguments; see stderr', 2)
             if argv[0] == 'top':
                 return json_failure('invalid arguments; see stderr', 1)
         raise
+    if args.command == 'reflink' and args.paths:
+        if args.host or args.local:
+            return refuse(args, 'coldcleaner: reflink does not combine positional paths with --host or --local', code=2)
+        try:
+            protected = _reflink_rules_protected(args)
+        except (OSError, ValueError) as exc:
+            rules_path = args.rules if args.rules is not None else rules.DEFAULT_PATH
+            code = 2 if isinstance(exc, (OSError, UnicodeDecodeError, rules.LocalHostError)) else 1
+            return refuse(args, rules_problem(rules_path, exc), code=code)
+        result = reflink.dedupe(
+            [str(p) for p in args.paths],
+            apply=args.apply,
+            min_bytes=args.min_bytes,
+            protected=protected,
+        )
+        if args.json:
+            print(json.dumps(dict(schema_version=JSON_SCHEMA_VERSION, **result)))
+        else:
+            print(reflink.render_text(result))
+        return 1 if result['errors'] else 0
+    if args.rules is None:
+        args.rules = rules.DEFAULT_PATH
     if args.command == 'init':
         from . import setup
         try:
@@ -437,8 +491,15 @@ def main(argv=None):
         if report_dir is not None and os.name != 'nt':
             config['report_dir'] = str(args.report_dir.resolve())
         selected = [hosts.HOSTS[args.host]] if getattr(args, 'host', None) else list(hosts.HOSTS.values())
-        if args.command in ('reclaim', 'doctor') and not args.host:
+        if args.command in ('reclaim', 'doctor', 'reflink') and not args.host:
             selected = [hosts.HOSTS[name] for name in config['reclaim_hosts']]
+        if args.command == 'reflink':
+            result = reflink.run_hosts(config, selected, apply=args.apply, min_bytes=args.min_bytes)
+            if args.json:
+                print(json.dumps(dict(schema_version=JSON_SCHEMA_VERSION, **result)))
+            else:
+                print(reflink.render_text(result))
+            return 1 if result['errors'] else 0
         if args.command == 'doctor':
             if not args.json:
                 return doctor.main(config, selected)
@@ -548,7 +609,7 @@ def main(argv=None):
             print(message, file=sys.stderr)
             print(json.dumps(summary([], args.apply, None, version.describe(), 'incomplete', [message]), default=str))
             return 2
-        if args.command in ('doctor', 'top') and args.json:
+        if args.command in ('doctor', 'top', 'reflink') and args.json:
             print(message, file=sys.stderr)
             return json_failure(message, 2)
         return refuse(args, message)
